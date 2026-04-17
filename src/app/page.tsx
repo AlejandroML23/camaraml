@@ -20,13 +20,11 @@ import {
   CircleStop,
   Download,
   ArrowLeft,
-  Webcam,
   Maximize2,
   Minimize2,
   Loader2,
   Settings,
   RefreshCw,
-  Bug,
 } from 'lucide-react'
 
 // ============ TYPES ============
@@ -64,7 +62,6 @@ export default function CamaraML() {
   const [streamActive, setStreamActive] = useState(false)
   const [connectionError, setConnectionError] = useState('')
   const [isFullscreen, setIsFullscreen] = useState(false)
-  const [debugLog, setDebugLog] = useState<string[]>([])
 
   const localStreamRef = useRef<MediaStream | null>(null)
   const mediaRecorderRef = useRef<MediaRecorder | null>(null)
@@ -82,10 +79,9 @@ export default function CamaraML() {
 
   const isReady = peerStatus === 'connected'
 
-  // ============ DEBUG LOGGER ============
+  // ============ DEBUG LOGGER (console only, no UI) ============
   const addLog = useCallback((msg: string) => {
     console.log('[CamaraML]', msg)
-    setDebugLog(prev => [...prev.slice(-29), msg])
   }, [])
 
   // ============ PEER LIFECYCLE ============
@@ -277,20 +273,69 @@ export default function CamaraML() {
   const connectToBroadcaster = (peer: Peer, broadcasterId: string) => {
     const pid = `${PEER_PREFIX}${broadcasterId}`
     addLog('Llamando a: ' + pid)
-    peer.connect(pid, { reliable: true })
 
-    const call = peer.call(pid, new MediaStream())
+    // Create a dummy silent audio track for better WebRTC compatibility on mobile
+    let dummyStream: MediaStream
+    try {
+      const ctx = new AudioContext()
+      const osc = ctx.createOscillator()
+      const dest = ctx.createMediaStreamDestination()
+      const gain = ctx.createGain()
+      gain.gain.value = 0 // silence
+      osc.connect(gain)
+      gain.connect(dest)
+      osc.start()
+      dummyStream = dest.stream
+      // Cleanup after 10 seconds (by then real connection is established)
+      setTimeout(() => { try { osc.stop(); ctx.close() } catch {} }, 10000)
+    } catch {
+      dummyStream = new MediaStream()
+    }
+
+    peer.connect(pid, { reliable: true })
+    const call = peer.call(pid, dummyStream)
     if (!call) { setConnectionError('No se pudo conectar.'); return }
     setConnectionError('Conectando...')
 
-    call.on('stream', remote => {
+    const onRemoteStream = (remote: MediaStream) => {
       addLog('STREAM REMOTO recibido! ' + remote.getTracks().length + ' tracks')
       setStreamActive(true); setConnectionError('')
-      if (remoteVideoRef.current) attachStream(remote, remoteVideoRef.current, 'REMOTE')
-      else addLog('CRÍTICO: remoteVideoRef es NULL')
-    })
+      const v = remoteVideoRef.current
+      if (v) {
+        attachStream(remote, v, 'REMOTE')
+        // After autoplay succeeds, unmute so the viewer can hear audio
+        const tryUnmute = () => { v.muted = false }
+        const checkReady = setInterval(() => {
+          if (!v.paused && v.readyState >= 2) {
+            clearInterval(checkReady)
+            tryUnmute()
+          }
+        }, 300)
+        // Safety: stop checking after 5 seconds
+        setTimeout(() => clearInterval(checkReady), 5000)
+      } else {
+        addLog('remoteVideoRef es NULL, reintentando en 1s...')
+        setTimeout(() => onRemoteStream(remote), 1000)
+      }
+    }
+
+    call.on('stream', onRemoteStream)
     call.on('close', () => { setStreamActive(false); setConnectionError('Emisor cerró.') })
     call.on('error', err => { setStreamActive(false); setConnectionError('Error video.'); addLog('Call error: ' + err) })
+
+    // Safety retry: if no stream after 5s, try calling again
+    setTimeout(() => {
+      if (!streamActive && peerRef.current && !peerRef.current.destroyed) {
+        addLog('RETRY: sin stream tras 5s, reintentando llamada...')
+        try {
+          const retryCall = peer.call(pid, dummyStream)
+          if (retryCall) {
+            retryCall.on('stream', onRemoteStream)
+            retryCall.on('error', () => { setConnectionError('Error al reconectar.') })
+          }
+        } catch (e: any) { addLog('Retry failed: ' + e.message) }
+      }
+    }, 5000)
   }
 
   // ============ RECORDING ============
@@ -382,6 +427,7 @@ export default function CamaraML() {
         <video
           ref={remoteVideoRef}
           autoPlay
+          muted
           playsInline
           style={{
             display: viewMode === 'watch' ? 'block' : 'none',
@@ -645,23 +691,6 @@ export default function CamaraML() {
         </header>
       )}
 
-      {/* ===== DEBUG PANEL ===== */}
-      {debugLog.length > 0 && (
-        <div className="fixed bottom-2 left-2 right-2 z-50 max-h-40 overflow-y-auto">
-          <Card className="border-amber-500/30 bg-amber-950/90 backdrop-blur-sm">
-            <CardContent className="p-2">
-              <div className="flex items-center gap-2 mb-1 text-amber-400">
-                <Bug className="w-3 h-3" />
-                <span className="text-[10px] font-bold">DIAGNOSTICO</span>
-                <button onClick={() => setDebugLog([])} className="text-[10px] text-amber-600 ml-auto hover:text-amber-400">X</button>
-              </div>
-              <div className="text-[9px] font-mono text-amber-200/80 space-y-px">
-                {debugLog.map((log, i) => <div key={i}>{log}</div>)}
-              </div>
-            </CardContent>
-          </Card>
-        </div>
-      )}
     </div>
   )
 }
