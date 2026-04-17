@@ -72,14 +72,12 @@ export default function CamaraML() {
   const peerRef = useRef<Peer | null>(null)
   const videoContainerRef = useRef<HTMLDivElement>(null)
 
-  // IMPORTANT: Both videos are ALWAYS in the DOM, inside the container.
-  // We control visibility with CSS, never destroy/recreate them.
   const localVideoRef = useRef<HTMLVideoElement>(null)
   const remoteVideoRef = useRef<HTMLVideoElement>(null)
 
   const isReady = peerStatus === 'connected'
 
-  // ============ DEBUG LOGGER (console only, no UI) ============
+  // ============ DEBUG (console only) ============
   const addLog = useCallback((msg: string) => {
     console.log('[CamaraML]', msg)
   }, [])
@@ -88,7 +86,7 @@ export default function CamaraML() {
   useEffect(() => {
     const peer = new Peer(undefined, { debug: 0 })
     peerRef.current = peer
-    peer.on('open', () => { setPeerStatus('connected'); addLog('Peer señalización OK') })
+    peer.on('open', () => { setPeerStatus('connected'); addLog('Peer OK') })
     peer.on('disconnected', () => setPeerStatus('disconnected'))
     peer.on('error', (e) => addLog('Peer error: ' + e.type))
     return () => { peer.destroy(); peerRef.current = null }
@@ -102,36 +100,10 @@ export default function CamaraML() {
     return r
   }
 
-  // ============ ATTACH STREAM TO VIDEO ============
-  const attachStream = useCallback((stream: MediaStream, videoEl: HTMLVideoElement | null, label: string): boolean => {
-    if (!videoEl) {
-      addLog(`${label}: videoEl es NULL!`)
-      return false
-    }
-    try {
-      videoEl.srcObject = stream
-      const tracks = stream.getTracks()
-      addLog(`${label}: srcObject asignado (${tracks.length} tracks: ${tracks.map(t => t.kind).join(',')})`)
-
-      const p = videoEl.play()
-      if (p && p.then) {
-        p.then(() => addLog(`${label}: play() OK`))
-          .catch(err => {
-            addLog(`${label}: play() falló: ${err.message}`)
-            setTimeout(() => videoEl.play().catch(e => addLog(`${label}: retry también falló: ${e.message}`)), 500)
-          })
-      }
-      return true
-    } catch (err: any) {
-      addLog(`${label}: EXCEPTION: ${err.message}`)
-      return false
-    }
-  }, [addLog])
-
   // ============ START BROADCASTING ============
   const startBroadcasting = async () => {
     setCameraError('')
-    addLog('=== INICIANDO TRANSMISIÓN ===')
+    addLog('=== INICIANDO TRANSMISION ===')
 
     const qc = QUALITY_OPTIONS.find(q => q.value === selectedQuality) || QUALITY_OPTIONS[1]
     let stream: MediaStream | null = null
@@ -141,18 +113,18 @@ export default function CamaraML() {
         video: { width: { ideal: qc.width }, height: { ideal: qc.height }, facingMode: { ideal: 'environment' } },
         audio: true,
       })
-      addLog('Cámara environment OK')
+      addLog('Camara OK')
     } catch (e1: any) {
-      addLog('Cámara environment falló: ' + e1.name + ' - probando genérica...')
+      addLog('Camara environment fallo, probando generica...')
       try {
         stream = await navigator.mediaDevices.getUserMedia({
           video: { width: { ideal: qc.width }, height: { ideal: qc.height } },
           audio: true,
         })
-        addLog('Cámara genérica OK')
+        addLog('Camara generica OK')
       } catch (e2: any) {
         addLog('TODAS fallaron: ' + e2.message)
-        setCameraError('No se pudo acceder a la cámara. ¿Concediste permisos? ¿Está en uso por otra app?')
+        setCameraError('No se pudo acceder a la camara. ¿Concediste permisos?')
         return
       }
     }
@@ -160,29 +132,32 @@ export default function CamaraML() {
     if (!stream) { setCameraError('Error desconocido.'); return }
 
     localStreamRef.current = stream
-
     const tracks = stream.getTracks()
-    addLog(`Stream: ${tracks.length} tracks — ${tracks.map(t => `${t.kind}(${t.label}) ready=${t.readyState}`).join(', ')}`)
+    addLog(`Stream: ${tracks.length} tracks`)
 
-    // Attach to the video element RIGHT NOW (it's always in the DOM!)
+    // Attach to video element NOW (always in DOM)
     const v = localVideoRef.current
     if (!v) {
-      addLog('CRÍTICO: localVideoRef.current es NULL')
-      setCameraError('Error del navegador. Recarga la página.')
+      addLog('CRITICO: localVideoRef NULL')
+      setCameraError('Error del navegador. Recarga la pagina.')
       stream.getTracks().forEach(t => t.stop())
       localStreamRef.current = null
       return
     }
 
-    const ok = attachStream(stream, v, 'LOCAL')
-    if (!ok) {
-      setCameraError('No se pudo conectar el stream al video.')
+    try {
+      v.srcObject = stream
+      await v.play()
+      addLog('LOCAL play OK')
+    } catch (err: any) {
+      addLog('LOCAL play fallo: ' + err.message)
+      setCameraError('No se pudo reproducir el video.')
       stream.getTracks().forEach(t => t.stop())
       localStreamRef.current = null
       return
     }
 
-    // Switch view — video is already playing inside the container!
+    // Switch view
     setViewMode('broadcast')
     addLog('Vista → broadcast')
 
@@ -227,22 +202,13 @@ export default function CamaraML() {
       if (err.type === 'unavailable-id') { stream.getTracks().forEach(t => t.stop()); localStreamRef.current = null; alert('Sala en uso.'); setViewMode('landing') }
     })
     peer.on('disconnected', () => { setPeerStatus('disconnected'); peer.reconnect() })
-
-    // Safety retry
-    setTimeout(() => {
-      const vv = localVideoRef.current
-      if (vv && localStreamRef.current && (vv.paused || !vv.srcObject)) {
-        addLog('SAFETY RETRY: video estaba pausado, reintentando...')
-        attachStream(localStreamRef.current, vv, 'RETRY')
-      }
-    }, 2000)
   }
 
   // ============ JOIN AS VIEWER ============
   const joinAsViewer = () => {
     const code = joinRoomInput.trim().toUpperCase()
     if (code.length < 4) return
-    setRoomId(code); setViewMode('watch'); setConnectionError('')
+    setRoomId(code); setViewMode('watch'); setConnectionError(''); setStreamActive(false)
     addLog('Conectando como viewer a: ' + code)
 
     if (peerRef.current) peerRef.current.destroy()
@@ -264,9 +230,9 @@ export default function CamaraML() {
     peer.on('open', () => { setPeerStatus('connected'); connectToBroadcaster(peer, code) })
     peer.on('error', err => {
       addLog('Viewer error: ' + err.type)
-      setConnectionError(err.type === 'peer-unavailable' ? 'Sala no encontrada. Verifica el código.' : 'Error de conexión.')
+      setConnectionError(err.type === 'peer-unavailable' ? 'Sala no encontrada. Verifica el codigo.' : 'Error de conexion.')
     })
-    peer.on('disconnected', () => { setPeerStatus('disconnected'); setStreamActive(false); setConnectionError('Conexión perdida.'); peer.reconnect() })
+    peer.on('disconnected', () => { setPeerStatus('disconnected'); setStreamActive(false); setConnectionError('Conexion perdida.'); peer.reconnect() })
   }
 
   // ============ CONNECT TO BROADCASTER ============
@@ -274,19 +240,16 @@ export default function CamaraML() {
     const pid = `${PEER_PREFIX}${broadcasterId}`
     addLog('Llamando a: ' + pid)
 
-    // Create a dummy silent audio track for better WebRTC compatibility on mobile
+    // Dummy audio track for WebRTC negotiation
     let dummyStream: MediaStream
     try {
       const ctx = new AudioContext()
       const osc = ctx.createOscillator()
       const dest = ctx.createMediaStreamDestination()
       const gain = ctx.createGain()
-      gain.gain.value = 0 // silence
-      osc.connect(gain)
-      gain.connect(dest)
-      osc.start()
+      gain.gain.value = 0
+      osc.connect(gain); gain.connect(dest); osc.start()
       dummyStream = dest.stream
-      // Cleanup after 10 seconds (by then real connection is established)
       setTimeout(() => { try { osc.stop(); ctx.close() } catch {} }, 10000)
     } catch {
       dummyStream = new MediaStream()
@@ -297,36 +260,121 @@ export default function CamaraML() {
     if (!call) { setConnectionError('No se pudo conectar.'); return }
     setConnectionError('Conectando...')
 
+    // Track the call so we can replace the stream later if needed
+    const currentCall = call
+
     const onRemoteStream = (remote: MediaStream) => {
-      addLog('STREAM REMOTO recibido! ' + remote.getTracks().length + ' tracks')
-      setStreamActive(true); setConnectionError('')
+      const tracks = remote.getTracks()
+      addLog(`STREAM REMOTO: ${tracks.length} tracks (${tracks.map(t => `${t.kind}:${t.readyState}`).join(', ')})`)
+
       const v = remoteVideoRef.current
-      if (v) {
-        attachStream(remote, v, 'REMOTE')
-        // After autoplay succeeds, unmute so the viewer can hear audio
-        const tryUnmute = () => { v.muted = false }
-        const checkReady = setInterval(() => {
-          if (!v.paused && v.readyState >= 2) {
-            clearInterval(checkReady)
-            tryUnmute()
-          }
-        }, 300)
-        // Safety: stop checking after 5 seconds
-        setTimeout(() => clearInterval(checkReady), 5000)
-      } else {
-        addLog('remoteVideoRef es NULL, reintentando en 1s...')
+      if (!v) {
+        addLog('remoteVideoRef NULL, retry 1s...')
         setTimeout(() => onRemoteStream(remote), 1000)
+        return
       }
+
+      // Clear previous
+      v.onloadeddata = null
+      v.onloadedmetadata = null
+      v.onresize = null
+      v.onerror = null
+      v.srcObject = null
+      v.load()
+
+      // Small delay then attach
+      setTimeout(() => {
+        v.srcObject = remote
+        v.muted = true
+
+        addLog('srcObject asignado al video remoto')
+
+        // Try to play immediately
+        const attemptPlay = () => {
+          v.play().then(() => {
+            addLog(`play() OK — videoWidth=${v.videoWidth} videoHeight=${v.videoHeight} readyState=${v.readyState}`)
+          }).catch(err => {
+            addLog('play() fallo: ' + err.message + ' — reintentando con gesture')
+            // Try with user gesture simulation
+            v.muted = true
+            v.play().catch(e2 => addLog('retry play fallo: ' + e2.message))
+          })
+        }
+
+        attemptPlay()
+
+        // When video metadata loads
+        v.onloadedmetadata = () => {
+          addLog(`onloadedmetadata: ${v.videoWidth}x${v.videoHeight}`)
+          if (v.paused) attemptPlay()
+        }
+
+        // When video data is ready to render
+        v.onloadeddata = () => {
+          addLog(`onloadeddata: ${v.videoWidth}x${v.videoHeight}`)
+          if (v.paused) attemptPlay()
+          if (v.videoWidth > 0) {
+            addLog('VIDEO DETECTADO via loadeddata')
+            setStreamActive(true)
+            setConnectionError('')
+          }
+        }
+
+        // When video dimensions change (first frame rendered)
+        v.onresize = () => {
+          addLog(`onresize: ${v.videoWidth}x${v.videoHeight}`)
+          if (v.videoWidth > 0) {
+            addLog('VIDEO RENDERIZANDO')
+            setStreamActive(true)
+            setConnectionError('')
+          }
+        }
+
+        // Error handler
+        v.onerror = (e) => {
+          addLog('video error: ' + JSON.stringify((e as any).target?.error))
+        }
+
+        // Monitor track states
+        tracks.forEach(track => {
+          track.onended = () => { addLog(`Track ended: ${track.kind}`); setStreamActive(false) }
+          track.onmute = () => addLog(`Track muted: ${track.kind}`)
+          track.onunmute = () => {
+            addLog(`Track unmuted: ${track.kind}`)
+            if (v.videoWidth > 0) { setStreamActive(true); setConnectionError('') }
+          }
+        })
+
+        // Periodic check: if no video after 10s, retry play
+        let checks = 0
+        const checker = setInterval(() => {
+          checks++
+          addLog(`Check #${checks}: vw=${v.videoWidth} vh=${v.videoHeight} paused=${v.paused} ready=${v.readyState} srcObj=${!!v.srcObject}`)
+          if (v.videoWidth > 0) {
+            setStreamActive(true)
+            setConnectionError('')
+            clearInterval(checker)
+            // Unmute audio after confirming video works
+            setTimeout(() => { v.muted = false }, 500)
+          } else if (checks >= 20) {
+            addLog('Sin video tras 10s de checks')
+            clearInterval(checker)
+          } else if (v.paused && v.srcObject) {
+            addLog('Video paused, reintentando play...')
+            attemptPlay()
+          }
+        }, 500)
+      }, 150)
     }
 
     call.on('stream', onRemoteStream)
-    call.on('close', () => { setStreamActive(false); setConnectionError('Emisor cerró.') })
-    call.on('error', err => { setStreamActive(false); setConnectionError('Error video.'); addLog('Call error: ' + err) })
+    call.on('close', () => { setStreamActive(false); setConnectionError('Emisor cerro la transmision.') })
+    call.on('error', err => { setStreamActive(false); setConnectionError('Error de video.'); addLog('Call error: ' + err) })
 
-    // Safety retry: if no stream after 5s, try calling again
+    // Safety retry: if no stream after 6s, try calling again
     setTimeout(() => {
       if (!streamActive && peerRef.current && !peerRef.current.destroyed) {
-        addLog('RETRY: sin stream tras 5s, reintentando llamada...')
+        addLog('RETRY: sin stream tras 6s...')
         try {
           const retryCall = peer.call(pid, dummyStream)
           if (retryCall) {
@@ -335,7 +383,7 @@ export default function CamaraML() {
           }
         } catch (e: any) { addLog('Retry failed: ' + e.message) }
       }
-    }, 5000)
+    }, 6000)
   }
 
   // ============ RECORDING ============
@@ -373,8 +421,8 @@ export default function CamaraML() {
     if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') mediaRecorderRef.current.stop()
     setIsRecording(false)
     if (recordingIntervalRef.current) { clearInterval(recordingIntervalRef.current); recordingIntervalRef.current = null }
-    if (localVideoRef.current) { localVideoRef.current.srcObject = null; localVideoRef.current.load() }
-    if (remoteVideoRef.current) { remoteVideoRef.current.srcObject = null; remoteVideoRef.current.load() }
+    if (localVideoRef.current) { localVideoRef.current.srcObject = null; localVideoRef.current.onloadeddata = null; localVideoRef.current.onloadedmetadata = null; localVideoRef.current.onresize = null; localVideoRef.current.load() }
+    if (remoteVideoRef.current) { remoteVideoRef.current.srcObject = null; remoteVideoRef.current.onloadeddata = null; remoteVideoRef.current.onloadedmetadata = null; remoteVideoRef.current.onresize = null; remoteVideoRef.current.load() }
     setStreamActive(false); setViewerCount(0); setConnectionError(''); setRoomId('')
     setViewMode('landing'); setRecordingTime(0); setPeerStatus('disconnected'); setCameraError('')
     const peer = new Peer(undefined, { debug: 0 }); peerRef.current = peer
@@ -400,109 +448,158 @@ export default function CamaraML() {
   // ============ RENDER ============
   return (
     <div className="min-h-screen flex flex-col">
-      {/* ===== VIDEO CONTAINER — ALWAYS in DOM, visibility controlled by CSS ===== */}
+      {/* ===== HEADER (always on top when active) ===== */}
+      {viewMode !== 'landing' && (
+        <header className="border-b bg-card/80 backdrop-blur-sm sticky top-0 z-30">
+          <div className="max-w-6xl mx-auto px-4 py-3 flex items-center justify-between flex-wrap gap-2">
+            <div className="flex items-center gap-3">
+              <Button variant="ghost" size="icon" onClick={cleanup}><ArrowLeft className="w-5 h-5" /></Button>
+              {viewMode === 'broadcast' ? (
+                <div className="flex items-center gap-2"><Video className="w-5 h-5 text-red-500" /><span className="font-bold text-lg"><span className="text-red-500">Camara</span>ML</span></div>
+              ) : (
+                <div className="flex items-center gap-2"><Eye className="w-5 h-5 text-emerald-500" /><span className="font-bold text-lg"><span className="text-emerald-500">Viendo</span> Camara</span></div>
+              )}
+            </div>
+            <div className="flex items-center gap-2 flex-wrap">
+              {roomId && (
+                <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-muted border">
+                  <span className="text-xs text-muted-foreground hidden sm:inline">Sala:</span>
+                  <span className="font-mono font-bold tracking-wider text-sm">{roomId}</span>
+                  {viewMode === 'broadcast' && (
+                    <Button variant="ghost" size="icon" className="h-6 w-6" onClick={copyRoomId}>
+                      {copied ? <Check className="w-3.5 h-3.5 text-emerald-500" /> : <Copy className="w-3.5 h-3.5" />}
+                    </Button>
+                  )}
+                </div>
+              )}
+              {viewMode === 'broadcast' && (
+                <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-muted border">
+                  <Users className="w-4 h-4" /><span className="text-sm font-medium">{viewerCount}</span>
+                </div>
+              )}
+              {localStreamRef.current && viewMode === 'broadcast' && (
+                <Badge variant="destructive" className="animate-pulse"><CircleAlert className="w-3 h-3 mr-1" />EN VIVO</Badge>
+              )}
+              {streamActive && viewMode === 'watch' && (
+                <Badge variant="destructive" className="animate-pulse"><CircleAlert className="w-3 h-3 mr-1" />EN VIVO</Badge>
+              )}
+            </div>
+          </div>
+        </header>
+      )}
+
+      {/* ===== VIDEO CONTAINER — always in DOM, proper layout ===== */}
       <div
-        ref={videoContainerRef}
-        className="relative bg-black rounded-xl overflow-hidden border border-border aspect-video max-h-[70vh]"
+        className="w-full max-w-6xl mx-auto px-4 pt-4"
         style={{ display: viewMode !== 'landing' ? 'block' : 'none' }}
       >
-        {/* Local video (broadcaster) */}
-        <video
-          ref={localVideoRef}
-          autoPlay
-          muted
-          playsInline
-          style={{
-            display: viewMode === 'broadcast' ? 'block' : 'none',
-            width: '100%',
-            height: '100%',
-            objectFit: 'contain',
-            position: 'absolute',
-            top: 0,
-            left: 0,
-          }}
-        />
+        <div
+          ref={videoContainerRef}
+          className="relative bg-black rounded-xl overflow-hidden border border-border"
+          style={{ aspectRatio: '16/9', maxHeight: '70vh', width: '100%' }}
+        >
+          {/* Local video (broadcaster) */}
+          <video
+            ref={localVideoRef}
+            autoPlay
+            muted
+            playsInline
+            style={{
+              display: viewMode === 'broadcast' ? 'block' : 'none',
+              width: '100%',
+              height: '100%',
+              objectFit: 'contain',
+              position: 'absolute',
+              top: 0,
+              left: 0,
+              zIndex: 1,
+            }}
+          />
 
-        {/* Remote video (viewer) */}
-        <video
-          ref={remoteVideoRef}
-          autoPlay
-          muted
-          playsInline
-          style={{
-            display: viewMode === 'watch' ? 'block' : 'none',
-            width: '100%',
-            height: '100%',
-            objectFit: 'contain',
-            position: 'absolute',
-            top: 0,
-            left: 0,
-          }}
-        />
+          {/* Remote video (viewer) */}
+          <video
+            ref={remoteVideoRef}
+            autoPlay
+            muted
+            playsInline
+            style={{
+              display: viewMode === 'watch' ? 'block' : 'none',
+              width: '100%',
+              height: '100%',
+              objectFit: 'contain',
+              position: 'absolute',
+              top: 0,
+              left: 0,
+              zIndex: 1,
+            }}
+          />
 
-        {/* ---- Broadcast overlays ---- */}
-        {viewMode === 'broadcast' && !localStreamRef.current && !cameraError && (
-              <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/80 z-10">
-                <Loader2 className="w-12 h-12 text-red-500 animate-spin mb-4" />
-                <p className="text-white text-sm">Iniciando camara...</p>
-                <p className="text-white/50 text-xs mt-1">Acepta los permisos si te lo pide el navegador</p>
+          {/* ---- Broadcast overlays ---- */}
+          {viewMode === 'broadcast' && !localStreamRef.current && !cameraError && (
+            <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/80" style={{ zIndex: 10 }}>
+              <Loader2 className="w-12 h-12 text-red-500 animate-spin mb-4" />
+              <p className="text-white text-sm">Iniciando camara...</p>
+              <p className="text-white/50 text-xs mt-1">Acepta los permisos si te lo pide el navegador</p>
+            </div>
+          )}
+
+          {viewMode === 'broadcast' && cameraError && (
+            <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/80" style={{ zIndex: 10 }}>
+              <CircleAlert className="w-12 h-12 text-amber-500 mb-4" />
+              <p className="text-white font-medium text-center px-4">{cameraError}</p>
+              <div className="flex gap-2 mt-4">
+                <Button variant="outline" onClick={retryCamera}><RefreshCw className="w-4 h-4 mr-2" />Reintentar</Button>
+                <Button variant="outline" onClick={cleanup}>Volver</Button>
               </div>
-            )}
+            </div>
+          )}
 
-            {viewMode === 'broadcast' && cameraError && (
-              <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/80 z-10">
-                <CircleAlert className="w-12 h-12 text-amber-500 mb-4" />
-                <p className="text-white font-medium text-center px-4">{cameraError}</p>
-                <div className="flex gap-2 mt-4">
-                  <Button variant="outline" onClick={retryCamera}><RefreshCw className="w-4 h-4 mr-2" />Reintentar</Button>
-                  <Button variant="outline" onClick={cleanup}>Volver</Button>
-                </div>
-              </div>
-            )}
+          {viewMode === 'broadcast' && isRecording && localStreamRef.current && (
+            <div className="absolute top-4 left-4 flex items-center gap-2 bg-black/70 backdrop-blur-sm rounded-full px-3 py-1.5" style={{ zIndex: 10 }}>
+              <div className="w-3 h-3 rounded-full bg-red-500 animate-pulse" />
+              <span className="text-white text-sm font-medium">REC {formatTime(recordingTime)}</span>
+            </div>
+          )}
 
-            {viewMode === 'broadcast' && isRecording && localStreamRef.current && (
-              <div className="absolute top-4 left-4 flex items-center gap-2 bg-black/70 backdrop-blur-sm rounded-full px-3 py-1.5 z-10">
-                <div className="w-3 h-3 rounded-full bg-red-500 animate-pulse" />
-                <span className="text-white text-sm font-medium">REC {formatTime(recordingTime)}</span>
-              </div>
-            )}
+          {viewMode === 'broadcast' && localStreamRef.current && (
+            <div className="absolute top-4 right-4 flex items-center gap-2" style={{ zIndex: 10 }}>
+              <Badge variant="destructive" className="bg-red-600">LIVE</Badge>
+              <Badge variant="outline" className="bg-black/70 text-white border-white/20 text-xs font-mono">{selectedQuality}</Badge>
+            </div>
+          )}
 
-            {viewMode === 'broadcast' && localStreamRef.current && (
-              <div className="absolute top-4 right-4 flex items-center gap-2 z-10">
-                <Badge variant="destructive" className="bg-red-600">LIVE</Badge>
-                <Badge variant="outline" className="bg-black/70 text-white border-white/20 text-xs font-mono">{selectedQuality}</Badge>
-              </div>
-            )}
+          {/* ---- Watch overlays ---- */}
+          {viewMode === 'watch' && !streamActive && (
+            <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/80" style={{ zIndex: 10 }}>
+              {connectionError ? (
+                <>
+                  <CircleAlert className="w-12 h-12 text-amber-500 mb-4" />
+                  <p className="text-foreground font-medium text-center px-4">{connectionError}</p>
+                  <div className="flex gap-2 mt-4">
+                    <Button variant="outline" onClick={retryConnection}><RefreshCw className="w-4 h-4 mr-2" />Reintentar</Button>
+                    <Button variant="outline" onClick={cleanup}>Volver</Button>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <Loader2 className="w-12 h-12 text-emerald-500 animate-spin mb-4" />
+                  <p className="text-white text-sm">Esperando transmision...</p>
+                </>
+              )}
+            </div>
+          )}
 
-        {/* ---- Watch overlays ---- */}
-            {viewMode === 'watch' && !streamActive && !connectionError && (
-              <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/80 z-10">
-                <Loader2 className="w-12 h-12 text-emerald-500 animate-spin mb-4" />
-                <p className="text-muted-foreground text-sm">Esperando transmision...</p>
-              </div>
-            )}
+          {viewMode === 'watch' && streamActive && (
+            <div className="absolute top-4 right-4" style={{ zIndex: 10 }}>
+              <Badge variant="destructive" className="bg-red-600"><CircleAlert className="w-3 h-3 mr-1" />LIVE</Badge>
+            </div>
+          )}
 
-            {viewMode === 'watch' && connectionError && !streamActive && (
-              <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/80 z-10">
-                <CircleAlert className="w-12 h-12 text-amber-500 mb-4" />
-                <p className="text-foreground font-medium text-center px-4">{connectionError}</p>
-                <div className="flex gap-2 mt-4">
-                  <Button variant="outline" onClick={retryConnection}><RefreshCw className="w-4 h-4 mr-2" />Reintentar</Button>
-                  <Button variant="outline" onClick={cleanup}>Volver</Button>
-                </div>
-              </div>
-            )}
-
-            {viewMode === 'watch' && streamActive && (
-              <div className="absolute top-4 right-4 z-10">
-                <Badge variant="destructive" className="bg-red-600"><CircleAlert className="w-3 h-3 mr-1" />LIVE</Badge>
-              </div>
-            )}
-
-            {/* Fullscreen button */}
-            <button onClick={toggleFullscreen} className="absolute bottom-4 right-4 bg-black/50 hover:bg-black/70 text-white rounded-full p-2 z-10">
-              {isFullscreen ? <Minimize2 className="w-5 h-5" /> : <Maximize2 className="w-5 h-5" />}
-            </button>
+          {/* Fullscreen button */}
+          <button onClick={toggleFullscreen} className="absolute bottom-4 right-4 bg-black/50 hover:bg-black/70 text-white rounded-full p-2" style={{ zIndex: 10 }}>
+            {isFullscreen ? <Minimize2 className="w-5 h-5" /> : <Maximize2 className="w-5 h-5" />}
+          </button>
+        </div>
       </div>
 
       {/* ===== LANDING VIEW ===== */}
@@ -601,7 +698,7 @@ export default function CamaraML() {
         </div>
       )}
 
-      {/* ===== BROADCAST CONTROLS (below video) ===== */}
+      {/* ===== BROADCAST CONTROLS ===== */}
       {viewMode === 'broadcast' && (
         <div className="max-w-6xl mx-auto w-full px-4 pb-4 space-y-4">
           <div className="flex flex-wrap items-center gap-3">
@@ -626,7 +723,7 @@ export default function CamaraML() {
         </div>
       )}
 
-      {/* ===== WATCH STATUS (below video) ===== */}
+      {/* ===== WATCH STATUS ===== */}
       {viewMode === 'watch' && (
         <div className="max-w-6xl mx-auto w-full px-4 pb-4 space-y-4">
           <Card>
@@ -649,46 +746,6 @@ export default function CamaraML() {
             </CardContent>
           </Card>
         </div>
-      )}
-
-      {/* ===== HEADER (shown in broadcast/watch) ===== */}
-      {viewMode !== 'landing' && (
-        <header className="border-b bg-card/80 backdrop-blur-sm sticky top-0 z-20">
-          <div className="max-w-6xl mx-auto px-4 py-3 flex items-center justify-between flex-wrap gap-2">
-            <div className="flex items-center gap-3">
-              <Button variant="ghost" size="icon" onClick={cleanup}><ArrowLeft className="w-5 h-5" /></Button>
-              {viewMode === 'broadcast' ? (
-                <div className="flex items-center gap-2"><Video className="w-5 h-5 text-red-500" /><span className="font-bold text-lg"><span className="text-red-500">Camara</span>ML</span></div>
-              ) : (
-                <div className="flex items-center gap-2"><Eye className="w-5 h-5 text-emerald-500" /><span className="font-bold text-lg"><span className="text-emerald-500">Viendo</span> Camara</span></div>
-              )}
-            </div>
-            <div className="flex items-center gap-2 flex-wrap">
-              {roomId && (
-                <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-muted border">
-                  <span className="text-xs text-muted-foreground hidden sm:inline">Sala:</span>
-                  <span className="font-mono font-bold tracking-wider text-sm">{roomId}</span>
-                  {viewMode === 'broadcast' && (
-                    <Button variant="ghost" size="icon" className="h-6 w-6" onClick={copyRoomId}>
-                      {copied ? <Check className="w-3.5 h-3.5 text-emerald-500" /> : <Copy className="w-3.5 h-3.5" />}
-                    </Button>
-                  )}
-                </div>
-              )}
-              {viewMode === 'broadcast' && (
-                <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-muted border">
-                  <Users className="w-4 h-4" /><span className="text-sm font-medium">{viewerCount}</span>
-                </div>
-              )}
-              {localStreamRef.current && viewMode === 'broadcast' && (
-                <Badge variant="destructive" className="animate-pulse"><CircleAlert className="w-3 h-3 mr-1" />EN VIVO</Badge>
-              )}
-              {streamActive && viewMode === 'watch' && (
-                <Badge variant="destructive" className="animate-pulse"><CircleAlert className="w-3 h-3 mr-1" />EN VIVO</Badge>
-              )}
-            </div>
-          </div>
-        </header>
       )}
 
     </div>
