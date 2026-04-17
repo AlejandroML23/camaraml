@@ -7,47 +7,25 @@ import { Input } from '@/components/ui/input'
 import { Card, CardContent } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import {
-  Video,
-  Radio,
-  Eye,
-  Copy,
-  Check,
-  MonitorPlay,
-  Shield,
-  Clock,
-  Users,
-  CircleAlert,
-  CircleStop,
-  Download,
-  ArrowLeft,
-  Maximize2,
-  Minimize2,
-  Loader2,
-  Settings,
-  RefreshCw,
+  Video, Radio, Eye, Copy, Check, MonitorPlay,
+  Shield, Clock, Users, CircleAlert, CircleStop,
+  Download, ArrowLeft, Maximize2, Minimize2,
+  Loader2, Settings, RefreshCw, Volume2, VolumeX,
 } from 'lucide-react'
 
-// ============ TYPES ============
 type ViewMode = 'landing' | 'broadcast' | 'watch'
 type VideoQuality = '720p' | '1080p' | '4K'
 
-interface QualityOption {
-  label: string
-  value: VideoQuality
-  width: number
-  height: number
-  description: string
-}
+interface QualityOption { label: string; value: VideoQuality; width: number; height: number; description: string }
 
 const QUALITY_OPTIONS: QualityOption[] = [
   { label: '720p', value: '720p', width: 1280, height: 720, description: 'HD - Buena calidad, bajo consumo' },
   { label: '1080p', value: '1080p', width: 1920, height: 1080, description: 'Full HD - Calidad alta recomendada' },
-  { label: '4K', value: '4K', width: 3840, height: 2160, description: 'Ultra HD - Maxima calidad (requiere dispositivo compatible)' },
+  { label: '4K', value: '4K', width: 3840, height: 2160, description: 'Ultra HD - Maxima calidad' },
 ]
 
 const PEER_PREFIX = 'camaraml-'
 
-// ============ MAIN COMPONENT ============
 export default function CamaraML() {
   const [viewMode, setViewMode] = useState<ViewMode>('landing')
   const [peerStatus, setPeerStatus] = useState<'disconnected' | 'connecting' | 'connected'>('disconnected')
@@ -62,6 +40,7 @@ export default function CamaraML() {
   const [streamActive, setStreamActive] = useState(false)
   const [connectionError, setConnectionError] = useState('')
   const [isFullscreen, setIsFullscreen] = useState(false)
+  const [isMuted, setIsMuted] = useState(true)
 
   const localStreamRef = useRef<MediaStream | null>(null)
   const mediaRecorderRef = useRef<MediaRecorder | null>(null)
@@ -71,40 +50,34 @@ export default function CamaraML() {
   const activeDataConnsRef = useRef<Map<string, DataConnection>>(new Map())
   const peerRef = useRef<Peer | null>(null)
   const videoContainerRef = useRef<HTMLDivElement>(null)
-
   const localVideoRef = useRef<HTMLVideoElement>(null)
-  const remoteVideoRef = useRef<HTMLVideoElement>(null)
+  const dynRemoteVideoRef = useRef<HTMLVideoElement | null>(null)
 
   const isReady = peerStatus === 'connected'
 
-  // ============ DEBUG (console only) ============
-  const addLog = useCallback((msg: string) => {
-    console.log('[CamaraML]', msg)
-  }, [])
+  const addLog = useCallback((msg: string) => { console.log('[CamaraML]', msg) }, [])
 
-  // ============ PEER LIFECYCLE ============
+  // ============ PEER ============
   useEffect(() => {
     const peer = new Peer(undefined, { debug: 0 })
     peerRef.current = peer
     peer.on('open', () => { setPeerStatus('connected'); addLog('Peer OK') })
     peer.on('disconnected', () => setPeerStatus('disconnected'))
-    peer.on('error', (e) => addLog('Peer error: ' + e.type))
+    peer.on('error', (e) => addLog('Peer err: ' + e.type))
     return () => { peer.destroy(); peerRef.current = null }
   }, [addLog])
 
-  // ============ GENERATE ROOM ID ============
   const generateRoomId = (): string => {
-    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
+    const c = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
     let r = ''
-    for (let i = 0; i < 6; i++) r += chars.charAt(Math.floor(Math.random() * chars.length))
+    for (let i = 0; i < 6; i++) r += c.charAt(Math.floor(Math.random() * c.length))
     return r
   }
 
-  // ============ START BROADCASTING ============
+  // ============ BROADCAST ============
   const startBroadcasting = async () => {
     setCameraError('')
-    addLog('=== INICIANDO TRANSMISION ===')
-
+    addLog('=== TRANSMISION ===')
     const qc = QUALITY_OPTIONS.find(q => q.value === selectedQuality) || QUALITY_OPTIONS[1]
     let stream: MediaStream | null = null
 
@@ -113,59 +86,32 @@ export default function CamaraML() {
         video: { width: { ideal: qc.width }, height: { ideal: qc.height }, facingMode: { ideal: 'environment' } },
         audio: true,
       })
-      addLog('Camara OK')
-    } catch (e1: any) {
-      addLog('Camara environment fallo, probando generica...')
+    } catch {
       try {
         stream = await navigator.mediaDevices.getUserMedia({
           video: { width: { ideal: qc.width }, height: { ideal: qc.height } },
           audio: true,
         })
-        addLog('Camara generica OK')
-      } catch (e2: any) {
-        addLog('TODAS fallaron: ' + e2.message)
-        setCameraError('No se pudo acceder a la camara. ¿Concediste permisos?')
+      } catch (e: any) {
+        setCameraError('No se pudo acceder a la camara.')
         return
       }
     }
 
     if (!stream) { setCameraError('Error desconocido.'); return }
-
     localStreamRef.current = stream
-    const tracks = stream.getTracks()
-    addLog(`Stream: ${tracks.length} tracks`)
 
-    // Attach to video element NOW (always in DOM)
     const v = localVideoRef.current
-    if (!v) {
-      addLog('CRITICO: localVideoRef NULL')
-      setCameraError('Error del navegador. Recarga la pagina.')
-      stream.getTracks().forEach(t => t.stop())
-      localStreamRef.current = null
-      return
-    }
+    if (!v) { setCameraError('Error del navegador.'); stream.getTracks().forEach(t => t.stop()); localStreamRef.current = null; return }
 
-    try {
-      v.srcObject = stream
-      await v.play()
-      addLog('LOCAL play OK')
-    } catch (err: any) {
-      addLog('LOCAL play fallo: ' + err.message)
-      setCameraError('No se pudo reproducir el video.')
-      stream.getTracks().forEach(t => t.stop())
-      localStreamRef.current = null
-      return
-    }
+    v.srcObject = stream
+    try { await v.play() } catch { setCameraError('No se pudo reproducir.'); stream.getTracks().forEach(t => t.stop()); localStreamRef.current = null; return }
 
-    // Switch view
     setViewMode('broadcast')
-    addLog('Vista → broadcast')
 
-    // PeerJS setup
     if (peerRef.current) peerRef.current.destroy()
     const newRoomId = generateRoomId()
     setRoomId(newRoomId)
-    addLog('Sala: ' + newRoomId)
 
     const peer = new Peer(`${PEER_PREFIX}${newRoomId}`, {
       debug: 0,
@@ -174,42 +120,38 @@ export default function CamaraML() {
           { urls: 'stun:stun.l.google.com:19302' },
           { urls: 'stun:stun1.l.google.com:19302' },
           { urls: 'stun:stun2.l.google.com:19302' },
-          { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
-          { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
         ],
       },
     })
     peerRef.current = peer
 
-    peer.on('open', () => addLog('Peer broadcast abierto'))
+    peer.on('open', () => addLog('Broadcaster peer abierto'))
     peer.on('call', call => {
+      addLog('Llamada recibida de: ' + call.peer)
       call.answer(stream)
       activeCallsRef.current.set(call.peer, call)
       setViewerCount(activeCallsRef.current.size)
-      addLog('Viewer conectado: ' + call.peer)
       call.on('stream', () => {})
       call.on('close', () => { activeCallsRef.current.delete(call.peer); setViewerCount(activeCallsRef.current.size) })
       call.on('error', () => { activeCallsRef.current.delete(call.peer); setViewerCount(activeCallsRef.current.size) })
     })
     peer.on('connection', conn => {
       activeDataConnsRef.current.set(conn.peer, conn)
-      setViewerCount(Math.max(activeCallsRef.current.size, activeDataConnsRef.current.size))
       conn.on('close', () => activeDataConnsRef.current.delete(conn.peer))
       conn.on('error', () => activeDataConnsRef.current.delete(conn.peer))
     })
     peer.on('error', err => {
-      addLog('Peer error: ' + err.type)
       if (err.type === 'unavailable-id') { stream.getTracks().forEach(t => t.stop()); localStreamRef.current = null; alert('Sala en uso.'); setViewMode('landing') }
     })
     peer.on('disconnected', () => { setPeerStatus('disconnected'); peer.reconnect() })
   }
 
-  // ============ JOIN AS VIEWER ============
+  // ============ VIEWER ============
   const joinAsViewer = () => {
     const code = joinRoomInput.trim().toUpperCase()
     if (code.length < 4) return
-    setRoomId(code); setViewMode('watch'); setConnectionError(''); setStreamActive(false)
-    addLog('Conectando como viewer a: ' + code)
+    setRoomId(code); setViewMode('watch'); setConnectionError(''); setStreamActive(false); setIsMuted(true)
+    addLog('Viewer conectando a: ' + code)
 
     if (peerRef.current) peerRef.current.destroy()
     const peer = new Peer(undefined, {
@@ -219,8 +161,6 @@ export default function CamaraML() {
           { urls: 'stun:stun.l.google.com:19302' },
           { urls: 'stun:stun1.l.google.com:19302' },
           { urls: 'stun:stun2.l.google.com:19302' },
-          { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
-          { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
         ],
       },
     })
@@ -229,18 +169,18 @@ export default function CamaraML() {
 
     peer.on('open', () => { setPeerStatus('connected'); connectToBroadcaster(peer, code) })
     peer.on('error', err => {
-      addLog('Viewer error: ' + err.type)
-      setConnectionError(err.type === 'peer-unavailable' ? 'Sala no encontrada. Verifica el codigo.' : 'Error de conexion.')
+      addLog('Viewer err: ' + err.type)
+      setConnectionError(err.type === 'peer-unavailable' ? 'Sala no encontrada.' : 'Error de conexion.')
     })
     peer.on('disconnected', () => { setPeerStatus('disconnected'); setStreamActive(false); setConnectionError('Conexion perdida.'); peer.reconnect() })
   }
 
-  // ============ CONNECT TO BROADCASTER ============
+  // ============ CONNECT (creates video in raw DOM) ============
   const connectToBroadcaster = (peer: Peer, broadcasterId: string) => {
     const pid = `${PEER_PREFIX}${broadcasterId}`
     addLog('Llamando a: ' + pid)
 
-    // Dummy audio track for WebRTC negotiation
+    // Dummy stream with silent audio
     let dummyStream: MediaStream
     try {
       const ctx = new AudioContext()
@@ -250,140 +190,127 @@ export default function CamaraML() {
       gain.gain.value = 0
       osc.connect(gain); gain.connect(dest); osc.start()
       dummyStream = dest.stream
-      setTimeout(() => { try { osc.stop(); ctx.close() } catch {} }, 10000)
+      setTimeout(() => { try { osc.stop(); ctx.close() } catch {} }, 15000)
     } catch {
       dummyStream = new MediaStream()
     }
 
-    peer.connect(pid, { reliable: true })
+    const dataConn = peer.connect(pid, { reliable: true })
     const call = peer.call(pid, dummyStream)
     if (!call) { setConnectionError('No se pudo conectar.'); return }
     setConnectionError('Conectando...')
 
-    // Track the call so we can replace the stream later if needed
-    const currentCall = call
-
-    const onRemoteStream = (remote: MediaStream) => {
+    const handleStream = (remote: MediaStream) => {
       const tracks = remote.getTracks()
-      addLog(`STREAM REMOTO: ${tracks.length} tracks (${tracks.map(t => `${t.kind}:${t.readyState}`).join(', ')})`)
+      addLog('STREAM recibido! ' + tracks.length + ' tracks: ' + tracks.map(t => t.kind + '=' + t.readyState).join(', '))
 
-      const v = remoteVideoRef.current
-      if (!v) {
-        addLog('remoteVideoRef NULL, retry 1s...')
-        setTimeout(() => onRemoteStream(remote), 1000)
+      const container = videoContainerRef.current
+      if (!container) {
+        addLog('container NULL, retry 500ms')
+        setTimeout(() => handleStream(remote), 500)
         return
       }
 
-      // Clear previous
-      v.onloadeddata = null
-      v.onloadedmetadata = null
-      v.onresize = null
-      v.onerror = null
-      v.srcObject = null
-      v.load()
+      // Remove any previous dynamic video
+      if (dynRemoteVideoRef.current && dynRemoteVideoRef.current.parentNode) {
+        dynRemoteVideoRef.current.parentNode.removeChild(dynRemoteVideoRef.current)
+      }
 
-      // Small delay then attach
-      setTimeout(() => {
-        v.srcObject = remote
-        v.muted = true
+      // CREATE VIDEO DIRECTLY IN DOM (bypass React)
+      const video = document.createElement('video')
+      video.id = 'camaraml-remote'
+      video.autoplay = true
+      video.muted = true
+      video.playsInline = true
+      video.setAttribute('playsinline', '')
+      video.setAttribute('autoplay', '')
+      video.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;object-fit:contain;z-index:1;background:#000;'
+      video.srcObject = remote
+      dynRemoteVideoRef.current = video
 
-        addLog('srcObject asignado al video remoto')
+      container.appendChild(video)
+      addLog('Video creado en DOM')
 
-        // Try to play immediately
-        const attemptPlay = () => {
-          v.play().then(() => {
-            addLog(`play() OK — videoWidth=${v.videoWidth} videoHeight=${v.videoHeight} readyState=${v.readyState}`)
-          }).catch(err => {
-            addLog('play() fallo: ' + err.message + ' — reintentando con gesture')
-            // Try with user gesture simulation
-            v.muted = true
-            v.play().catch(e2 => addLog('retry play fallo: ' + e2.message))
-          })
-        }
-
-        attemptPlay()
-
-        // When video metadata loads
-        v.onloadedmetadata = () => {
-          addLog(`onloadedmetadata: ${v.videoWidth}x${v.videoHeight}`)
-          if (v.paused) attemptPlay()
-        }
-
-        // When video data is ready to render
-        v.onloadeddata = () => {
-          addLog(`onloadeddata: ${v.videoWidth}x${v.videoHeight}`)
-          if (v.paused) attemptPlay()
-          if (v.videoWidth > 0) {
-            addLog('VIDEO DETECTADO via loadeddata')
-            setStreamActive(true)
-            setConnectionError('')
-          }
-        }
-
-        // When video dimensions change (first frame rendered)
-        v.onresize = () => {
-          addLog(`onresize: ${v.videoWidth}x${v.videoHeight}`)
-          if (v.videoWidth > 0) {
-            addLog('VIDEO RENDERIZANDO')
-            setStreamActive(true)
-            setConnectionError('')
-          }
-        }
-
-        // Error handler
-        v.onerror = (e) => {
-          addLog('video error: ' + JSON.stringify((e as any).target?.error))
-        }
-
-        // Monitor track states
-        tracks.forEach(track => {
-          track.onended = () => { addLog(`Track ended: ${track.kind}`); setStreamActive(false) }
-          track.onmute = () => addLog(`Track muted: ${track.kind}`)
-          track.onunmute = () => {
-            addLog(`Track unmuted: ${track.kind}`)
-            if (v.videoWidth > 0) { setStreamActive(true); setConnectionError('') }
-          }
+      const tryPlay = () => {
+        video.play().then(() => {
+          addLog('play() OK vw=' + video.videoWidth + ' vh=' + video.videoHeight)
+        }).catch(e => {
+          addLog('play fail: ' + e.message)
         })
+      }
 
-        // Periodic check: if no video after 10s, retry play
-        let checks = 0
-        const checker = setInterval(() => {
-          checks++
-          addLog(`Check #${checks}: vw=${v.videoWidth} vh=${v.videoHeight} paused=${v.paused} ready=${v.readyState} srcObj=${!!v.srcObject}`)
-          if (v.videoWidth > 0) {
-            setStreamActive(true)
-            setConnectionError('')
-            clearInterval(checker)
-            // Unmute audio after confirming video works
-            setTimeout(() => { v.muted = false }, 500)
-          } else if (checks >= 20) {
-            addLog('Sin video tras 10s de checks')
-            clearInterval(checker)
-          } else if (v.paused && v.srcObject) {
-            addLog('Video paused, reintentando play...')
-            attemptPlay()
-          }
-        }, 500)
-      }, 150)
+      video.onloadedmetadata = () => {
+        addLog('metadata: ' + video.videoWidth + 'x' + video.videoHeight)
+        tryPlay()
+      }
+
+      video.onloadeddata = () => {
+        addLog('data loaded: ' + video.videoWidth + 'x' + video.videoHeight)
+        if (video.videoWidth > 0) {
+          setStreamActive(true)
+          setConnectionError('')
+          addLog('VIDEO OK!!!')
+        }
+      }
+
+      video.onresize = () => {
+        addLog('resize: ' + video.videoWidth + 'x' + video.videoHeight)
+        if (video.videoWidth > 0) {
+          setStreamActive(true)
+          setConnectionError('')
+        }
+      }
+
+      video.onpause = () => { addLog('video paused! retrying...'); tryPlay() }
+
+      video.onerror = (e) => {
+        const err = (e.target as HTMLVideoElement).error
+        addLog('VIDEO ERROR: ' + (err ? err.code + ' ' + err.message : 'unknown'))
+      }
+
+      tracks.forEach(track => {
+        track.onended = () => { addLog('Track ended: ' + track.kind); setStreamActive(false) }
+        track.onmute = () => addLog('Track muted: ' + track.kind)
+        track.onunmute = () => addLog('Track unmuted: ' + track.kind)
+      })
+
+      tryPlay()
+
+      // Monitor: retry play if no video after 1s, 3s, 5s
+      setTimeout(() => {
+        if (video.videoWidth === 0 && video.srcObject) { addLog('No video 1s, retry play'); tryPlay() }
+      }, 1000)
+      setTimeout(() => {
+        if (video.videoWidth === 0 && video.srcObject) { addLog('No video 3s, retry play'); tryPlay() }
+      }, 3000)
+      setTimeout(() => {
+        if (video.videoWidth === 0 && video.srcObject) { addLog('No video 5s, retry play'); tryPlay() }
+      }, 5000)
+      setTimeout(() => {
+        if (video.videoWidth === 0) {
+          addLog('STILL NO VIDEO after 8s. Stream tracks:')
+          remote.getTracks().forEach(t => addLog('  ' + t.kind + ' ready=' + t.readyState + ' enabled=' + t.enabled + ' muted=' + t.muted))
+        }
+      }, 8000)
     }
 
-    call.on('stream', onRemoteStream)
+    call.on('stream', handleStream)
     call.on('close', () => { setStreamActive(false); setConnectionError('Emisor cerro la transmision.') })
-    call.on('error', err => { setStreamActive(false); setConnectionError('Error de video.'); addLog('Call error: ' + err) })
+    call.on('error', err => { setStreamActive(false); setConnectionError('Error de video.'); addLog('Call err: ' + err) })
 
-    // Safety retry: if no stream after 6s, try calling again
+    // ICE connection state monitoring
+    call.on('iceStateChanged', (state: string) => { addLog('ICE: ' + state) })
+
+    // Retry if no stream after 8s
     setTimeout(() => {
       if (!streamActive && peerRef.current && !peerRef.current.destroyed) {
-        addLog('RETRY: sin stream tras 6s...')
+        addLog('RETRY: no stream, calling again...')
         try {
-          const retryCall = peer.call(pid, dummyStream)
-          if (retryCall) {
-            retryCall.on('stream', onRemoteStream)
-            retryCall.on('error', () => { setConnectionError('Error al reconectar.') })
-          }
-        } catch (e: any) { addLog('Retry failed: ' + e.message) }
+          const rc = peer.call(pid, dummyStream)
+          if (rc) { rc.on('stream', handleStream); rc.on('error', () => { setConnectionError('Error reconectar.') }) }
+        } catch (e: any) { addLog('Retry err: ' + e.message) }
       }
-    }, 6000)
+    }, 8000)
   }
 
   // ============ RECORDING ============
@@ -421,15 +348,19 @@ export default function CamaraML() {
     if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') mediaRecorderRef.current.stop()
     setIsRecording(false)
     if (recordingIntervalRef.current) { clearInterval(recordingIntervalRef.current); recordingIntervalRef.current = null }
-    if (localVideoRef.current) { localVideoRef.current.srcObject = null; localVideoRef.current.onloadeddata = null; localVideoRef.current.onloadedmetadata = null; localVideoRef.current.onresize = null; localVideoRef.current.load() }
-    if (remoteVideoRef.current) { remoteVideoRef.current.srcObject = null; remoteVideoRef.current.onloadeddata = null; remoteVideoRef.current.onloadedmetadata = null; remoteVideoRef.current.onresize = null; remoteVideoRef.current.load() }
+    if (localVideoRef.current) { localVideoRef.current.srcObject = null; localVideoRef.current.load() }
+    // Remove dynamic video
+    if (dynRemoteVideoRef.current && dynRemoteVideoRef.current.parentNode) {
+      dynRemoteVideoRef.current.parentNode.removeChild(dynRemoteVideoRef.current)
+      dynRemoteVideoRef.current = null
+    }
     setStreamActive(false); setViewerCount(0); setConnectionError(''); setRoomId('')
     setViewMode('landing'); setRecordingTime(0); setPeerStatus('disconnected'); setCameraError('')
+    setIsMuted(true)
     const peer = new Peer(undefined, { debug: 0 }); peerRef.current = peer
     peer.on('open', () => setPeerStatus('connected'))
     peer.on('disconnected', () => setPeerStatus('disconnected'))
     peer.on('error', () => setPeerStatus('disconnected'))
-    addLog('Cleanup OK')
   }
 
   const retryConnection = () => { const id = roomId; cleanup(); setTimeout(() => { setJoinRoomInput(id); joinAsViewer() }, 500) }
@@ -440,6 +371,12 @@ export default function CamaraML() {
     if (!document.fullscreenElement) { videoContainerRef.current.requestFullscreen(); setIsFullscreen(true) }
     else { document.exitFullscreen(); setIsFullscreen(false) }
   }
+  const toggleMute = () => {
+    if (dynRemoteVideoRef.current) {
+      dynRemoteVideoRef.current.muted = !dynRemoteVideoRef.current.muted
+      setIsMuted(dynRemoteVideoRef.current.muted)
+    }
+  }
   const formatTime = (s: number) => {
     const h = Math.floor(s/3600), m = Math.floor((s%3600)/60), sec = s%60
     return h > 0 ? `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(sec).padStart(2,'0')}` : `${String(m).padStart(2,'0')}:${String(sec).padStart(2,'0')}`
@@ -448,10 +385,11 @@ export default function CamaraML() {
   // ============ RENDER ============
   return (
     <div className="min-h-screen flex flex-col">
-      {/* ===== HEADER (always on top when active) ===== */}
+
+      {/* HEADER */}
       {viewMode !== 'landing' && (
         <header className="border-b bg-card/80 backdrop-blur-sm sticky top-0 z-30">
-          <div className="max-w-6xl mx-auto px-4 py-3 flex items-center justify-between flex-wrap gap-2">
+          <div className="max-w-5xl mx-auto px-4 py-3 flex items-center justify-between flex-wrap gap-2">
             <div className="flex items-center gap-3">
               <Button variant="ghost" size="icon" onClick={cleanup}><ArrowLeft className="w-5 h-5" /></Button>
               {viewMode === 'broadcast' ? (
@@ -488,17 +426,14 @@ export default function CamaraML() {
         </header>
       )}
 
-      {/* ===== VIDEO CONTAINER — always in DOM, proper layout ===== */}
-      <div
-        className="w-full max-w-6xl mx-auto px-4 pt-4"
-        style={{ display: viewMode !== 'landing' ? 'block' : 'none' }}
-      >
+      {/* VIDEO AREA */}
+      <div className="w-full max-w-5xl mx-auto px-4 pt-4" style={{ display: viewMode !== 'landing' ? 'block' : 'none' }}>
         <div
           ref={videoContainerRef}
           className="relative bg-black rounded-xl overflow-hidden border border-border"
-          style={{ aspectRatio: '16/9', maxHeight: '70vh', width: '100%' }}
+          style={{ width: '100%', height: '65vh', minHeight: '250px' }}
         >
-          {/* Local video (broadcaster) */}
+          {/* Local video (broadcaster) — React element */}
           <video
             ref={localVideoRef}
             autoPlay
@@ -513,33 +448,36 @@ export default function CamaraML() {
               top: 0,
               left: 0,
               zIndex: 1,
+              background: '#000',
             }}
           />
 
-          {/* Remote video (viewer) */}
-          <video
-            ref={remoteVideoRef}
-            autoPlay
-            muted
-            playsInline
-            style={{
-              display: viewMode === 'watch' ? 'block' : 'none',
-              width: '100%',
-              height: '100%',
-              objectFit: 'contain',
-              position: 'absolute',
-              top: 0,
-              left: 0,
-              zIndex: 1,
-            }}
-          />
+          {/* Remote video is created DYNAMICALLY in DOM by connectToBroadcaster */}
 
-          {/* ---- Broadcast overlays ---- */}
+          {/* Loading overlay */}
+          {viewMode === 'watch' && !streamActive && !connectionError && (
+            <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/80" style={{ zIndex: 10 }}>
+              <Loader2 className="w-12 h-12 text-emerald-500 animate-spin mb-4" />
+              <p className="text-white text-sm">Esperando transmision...</p>
+              <p className="text-white/40 text-xs mt-2">Abre la consola (F12) para ver diagnosticos</p>
+            </div>
+          )}
+
+          {viewMode === 'watch' && connectionError && (
+            <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/80" style={{ zIndex: 10 }}>
+              <CircleAlert className="w-12 h-12 text-amber-500 mb-4" />
+              <p className="text-white font-medium text-center px-4">{connectionError}</p>
+              <div className="flex gap-2 mt-4">
+                <Button variant="outline" onClick={retryConnection}><RefreshCw className="w-4 h-4 mr-2" />Reintentar</Button>
+                <Button variant="outline" onClick={cleanup}>Volver</Button>
+              </div>
+            </div>
+          )}
+
           {viewMode === 'broadcast' && !localStreamRef.current && !cameraError && (
             <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/80" style={{ zIndex: 10 }}>
               <Loader2 className="w-12 h-12 text-red-500 animate-spin mb-4" />
               <p className="text-white text-sm">Iniciando camara...</p>
-              <p className="text-white/50 text-xs mt-1">Acepta los permisos si te lo pide el navegador</p>
             </div>
           )}
 
@@ -568,41 +506,22 @@ export default function CamaraML() {
             </div>
           )}
 
-          {/* ---- Watch overlays ---- */}
-          {viewMode === 'watch' && !streamActive && (
-            <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/80" style={{ zIndex: 10 }}>
-              {connectionError ? (
-                <>
-                  <CircleAlert className="w-12 h-12 text-amber-500 mb-4" />
-                  <p className="text-foreground font-medium text-center px-4">{connectionError}</p>
-                  <div className="flex gap-2 mt-4">
-                    <Button variant="outline" onClick={retryConnection}><RefreshCw className="w-4 h-4 mr-2" />Reintentar</Button>
-                    <Button variant="outline" onClick={cleanup}>Volver</Button>
-                  </div>
-                </>
-              ) : (
-                <>
-                  <Loader2 className="w-12 h-12 text-emerald-500 animate-spin mb-4" />
-                  <p className="text-white text-sm">Esperando transmision...</p>
-                </>
-              )}
-            </div>
-          )}
-
           {viewMode === 'watch' && streamActive && (
-            <div className="absolute top-4 right-4" style={{ zIndex: 10 }}>
+            <div className="absolute top-4 right-4 flex items-center gap-2" style={{ zIndex: 10 }}>
               <Badge variant="destructive" className="bg-red-600"><CircleAlert className="w-3 h-3 mr-1" />LIVE</Badge>
+              <button onClick={toggleMute} className="bg-black/60 hover:bg-black/80 text-white rounded-full p-2">
+                {isMuted ? <VolumeX className="w-4 h-4" /> : <Volume2 className="w-4 h-4" />}
+              </button>
             </div>
           )}
 
-          {/* Fullscreen button */}
           <button onClick={toggleFullscreen} className="absolute bottom-4 right-4 bg-black/50 hover:bg-black/70 text-white rounded-full p-2" style={{ zIndex: 10 }}>
             {isFullscreen ? <Minimize2 className="w-5 h-5" /> : <Maximize2 className="w-5 h-5" />}
           </button>
         </div>
       </div>
 
-      {/* ===== LANDING VIEW ===== */}
+      {/* LANDING */}
       {viewMode === 'landing' && (
         <div className="flex-1 flex flex-col items-center justify-center p-4">
           <div className="w-full max-w-lg space-y-8">
@@ -698,9 +617,9 @@ export default function CamaraML() {
         </div>
       )}
 
-      {/* ===== BROADCAST CONTROLS ===== */}
+      {/* BROADCAST CONTROLS */}
       {viewMode === 'broadcast' && (
-        <div className="max-w-6xl mx-auto w-full px-4 pb-4 space-y-4">
+        <div className="max-w-5xl mx-auto w-full px-4 pb-4 space-y-4">
           <div className="flex flex-wrap items-center gap-3">
             <Button onClick={toggleRecording} variant={isRecording ? 'destructive' : 'default'} size="lg" disabled={!localStreamRef.current}>
               {isRecording ? <><CircleStop className="w-5 h-5 mr-2" />Detener Grabacion</> : <><div className="w-4 h-4 rounded-full border-2 border-current mr-2" />Iniciar Grabacion</>}
@@ -723,9 +642,9 @@ export default function CamaraML() {
         </div>
       )}
 
-      {/* ===== WATCH STATUS ===== */}
+      {/* WATCH STATUS */}
       {viewMode === 'watch' && (
-        <div className="max-w-6xl mx-auto w-full px-4 pb-4 space-y-4">
+        <div className="max-w-5xl mx-auto w-full px-4 pb-4 space-y-4">
           <Card>
             <CardContent className="p-4">
               <div className="flex flex-wrap items-center justify-between gap-4 text-sm">
