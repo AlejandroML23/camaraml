@@ -25,6 +25,14 @@ const QUALITY_OPTIONS: QualityOption[] = [
 ]
 
 const PEER_PREFIX = 'camaraml-'
+const ICE_SERVERS = [
+  { urls: 'stun:stun.l.google.com:19302' },
+  { urls: 'stun:stun1.l.google.com:19302' },
+  { urls: 'stun:stun2.l.google.com:19302' },
+  { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
+  { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
+  { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
+]
 
 export default function CamaraML() {
   const [viewMode, setViewMode] = useState<ViewMode>('landing')
@@ -41,6 +49,7 @@ export default function CamaraML() {
   const [connectionError, setConnectionError] = useState('')
   const [isFullscreen, setIsFullscreen] = useState(false)
   const [isMuted, setIsMuted] = useState(true)
+  const [statusText, setStatusText] = useState('')
 
   const localStreamRef = useRef<MediaStream | null>(null)
   const mediaRecorderRef = useRef<MediaRecorder | null>(null)
@@ -55,7 +64,9 @@ export default function CamaraML() {
 
   const isReady = peerStatus === 'connected'
 
-  const addLog = useCallback((msg: string) => { console.log('[CamaraML]', msg) }, [])
+  const addLog = useCallback((msg: string) => {
+    console.log('[CamaraML]', msg)
+  }, [])
 
   useEffect(() => {
     const peer = new Peer(undefined, { debug: 0 })
@@ -73,6 +84,9 @@ export default function CamaraML() {
     return r
   }
 
+  // =============================================
+  // BROADCAST: Camera → viewer (broadcaster CALLS viewer)
+  // =============================================
   const startBroadcasting = async () => {
     setCameraError('')
     addLog('=== TRANSMISION ===')
@@ -100,10 +114,9 @@ export default function CamaraML() {
     localStreamRef.current = stream
 
     const v = localVideoRef.current
-    if (!v) { setCameraError('Error del navegador.'); stream.getTracks().forEach(t => t.stop()); localStreamRef.current = null; return }
-
+    if (!v) { setCameraError('Error.'); stream.getTracks().forEach(t => t.stop()); localStreamRef.current = null; return }
     v.srcObject = stream
-    try { await v.play() } catch { setCameraError('No se pudo reproducir.'); stream.getTracks().forEach(t => t.stop()); localStreamRef.current = null; return }
+    try { await v.play() } catch { setCameraError('No reprodujo.'); stream.getTracks().forEach(t => t.stop()); localStreamRef.current = null; return }
 
     setViewMode('broadcast')
 
@@ -112,23 +125,56 @@ export default function CamaraML() {
     setRoomId(newRoomId)
 
     const peer = new Peer(`${PEER_PREFIX}${newRoomId}`, {
-      debug: 0,
-      config: {
-        iceServers: [
-          { urls: 'stun:stun.l.google.com:19302' },
-          { urls: 'stun:stun1.l.google.com:19302' },
-          { urls: 'stun:stun2.l.google.com:19302' },
-          { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
-          { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
-          { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
-        ],
-      },
+      debug: 1,
+      config: { iceServers: ICE_SERVERS },
     })
     peerRef.current = peer
 
-    peer.on('open', () => addLog('Broadcaster peer abierto: ' + peer.id))
-    peer.on('call', call => {
-      addLog('Llamada recibida de: ' + call.peer)
+    peer.on('open', () => addLog('Broadcaster listo: ' + peer.id))
+
+    // *** KEY CHANGE: When a viewer connects via data, BROADCASTER calls the viewer ***
+    peer.on('connection', (conn) => {
+      addLog('Viewer conectado (data): ' + conn.peer)
+      activeDataConnsRef.current.set(conn.peer, conn)
+
+      conn.on('data', (data) => {
+        addLog('Mensaje del viewer: ' + JSON.stringify(data))
+        // Viewer says "join" with their peer ID — call them with our stream!
+        if (data && data.type === 'join') {
+          addLog('Llamando al viewer ' + conn.peer + ' con stream...')
+          try {
+            const call = peer.call(conn.peer, stream)
+            if (call) {
+              addLog('Call creada hacia ' + conn.peer)
+              activeCallsRef.current.set(conn.peer, call)
+              setViewerCount(activeCallsRef.current.size)
+
+              call.on('close', () => { activeCallsRef.current.delete(conn.peer); setViewerCount(activeCallsRef.current.size) })
+              call.on('error', (err) => { addLog('Call error: ' + err); activeCallsRef.current.delete(conn.peer); setViewerCount(activeCallsRef.current.size) })
+
+              // Monitor ICE
+              const pc = call.peerConnection
+              if (pc) {
+                pc.oniceconnectionstatechange = () => {
+                  addLog('Broadcaster ICE: ' + pc.iceConnectionState)
+                }
+              }
+            } else {
+              addLog('ERROR: peer.call devolvio NULL')
+            }
+          } catch (e: any) {
+            addLog('ERROR llamando viewer: ' + e.message)
+          }
+        }
+      })
+
+      conn.on('close', () => { activeDataConnsRef.current.delete(conn.peer); setViewerCount(Math.max(0, activeCallsRef.current.size - 1)) })
+      conn.on('error', () => { activeDataConnsRef.current.delete(conn.peer) })
+    })
+
+    // Also handle legacy direct calls (backward compat)
+    peer.on('call', (call) => {
+      addLog('Llamada directa recibida de: ' + call.peer)
       call.answer(stream)
       activeCallsRef.current.set(call.peer, call)
       setViewerCount(activeCallsRef.current.size)
@@ -136,185 +182,242 @@ export default function CamaraML() {
       call.on('close', () => { activeCallsRef.current.delete(call.peer); setViewerCount(activeCallsRef.current.size) })
       call.on('error', () => { activeCallsRef.current.delete(call.peer); setViewerCount(activeCallsRef.current.size) })
     })
-    peer.on('connection', conn => {
-      activeDataConnsRef.current.set(conn.peer, conn)
-      conn.on('close', () => activeDataConnsRef.current.delete(conn.peer))
-      conn.on('error', () => activeDataConnsRef.current.delete(conn.peer))
-    })
-    peer.on('error', err => {
+
+    peer.on('error', (err) => {
+      addLog('Peer error: ' + err.type)
       if (err.type === 'unavailable-id') { stream.getTracks().forEach(t => t.stop()); localStreamRef.current = null; alert('Sala en uso.'); setViewMode('landing') }
     })
     peer.on('disconnected', () => { setPeerStatus('disconnected'); peer.reconnect() })
   }
 
+  // =============================================
+  // VIEWER: Connects via data, receives call from broadcaster
+  // =============================================
   const joinAsViewer = () => {
     const code = joinRoomInput.trim().toUpperCase()
     if (code.length < 4) return
-    setRoomId(code); setViewMode('watch'); setConnectionError(''); setStreamActive(false); setIsMuted(true)
-    addLog('Viewer conectando a: ' + code)
+    setRoomId(code)
+    setViewMode('watch')
+    setConnectionError('')
+    setStreamActive(false)
+    setIsMuted(true)
+    setStatusText('Conectando...')
+    addLog('Viewer uniendose a: ' + code)
 
     if (peerRef.current) peerRef.current.destroy()
     const peer = new Peer(undefined, {
-      debug: 0,
-      config: {
-        iceServers: [
-          { urls: 'stun:stun.l.google.com:19302' },
-          { urls: 'stun:stun1.l.google.com:19302' },
-          { urls: 'stun:stun2.l.google.com:19302' },
-          { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
-          { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
-          { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
-        ],
-      },
+      debug: 1,
+      config: { iceServers: ICE_SERVERS },
     })
     peerRef.current = peer
     setPeerStatus('connecting')
 
-    peer.on('open', () => { addLog('Viewer peer abierto: ' + peer.id); setPeerStatus('connected'); connectToBroadcaster(peer, code) })
-    peer.on('error', err => {
-      addLog('Viewer err: ' + err.type)
-      setConnectionError(err.type === 'peer-unavailable' ? 'Sala no encontrada.' : 'Error de conexion.')
-    })
-    peer.on('disconnected', () => { setPeerStatus('disconnected'); setStreamActive(false); setConnectionError('Conexion perdida.'); peer.reconnect() })
-  }
+    peer.on('open', () => {
+      addLog('Viewer peer listo: ' + peer.id)
+      setPeerStatus('connected')
+      setStatusText('Peer listo, conectando con emisor...')
 
-  const connectToBroadcaster = (peer: Peer, broadcasterId: string) => {
-    const pid = `${PEER_PREFIX}${broadcasterId}`
-    addLog('Llamando a: ' + pid)
+      const pid = `${PEER_PREFIX}${code}`
 
-    let dummyStream: MediaStream
-    try {
-      const ctx = new AudioContext()
-      const osc = ctx.createOscillator()
-      const dest = ctx.createMediaStreamDestination()
-      const gain = ctx.createGain()
-      gain.gain.value = 0
-      osc.connect(gain); gain.connect(dest); osc.start()
-      dummyStream = dest.stream
-      setTimeout(() => { try { osc.stop(); ctx.close() } catch {} }, 15000)
-    } catch {
-      dummyStream = new MediaStream()
-    }
+      // Step 1: Open data connection to broadcaster
+      setStatusText('Abriendo canal de datos...')
+      const dataConn = peer.connect(pid, { reliable: true })
 
-    const dataConn = peer.connect(pid, { reliable: true })
-    dataConn.on('open', () => { addLog('Data connection ABIERTA con: ' + pid) })
-    dataConn.on('error', (err) => { addLog('Data conn error: ' + err) })
+      dataConn.on('open', () => {
+        addLog('Data connection ABIERTA')
+        setStatusText('Canal abierto, solicitando video...')
 
-    const call = peer.call(pid, dummyStream)
-    addLog('peer.call creado hacia: ' + pid)
-    if (!call) { setConnectionError('No se pudo iniciar la llamada.'); addLog('call es NULL!'); return }
-    setConnectionError('Conectando...')
-
-    const callPeerConn = call.peerConnection
-    if (callPeerConn) {
-      callPeerConn.oniceconnectionstatechange = () => {
-        const s = callPeerConn.iceConnectionState
-        addLog('ICE state: ' + s)
-        if (s === 'failed' || s === 'disconnected') {
-          setConnectionError('Error de conexion ICE (' + s + '). Ambos dispositivos deben tener internet.')
-        }
-        if (s === 'connected' || s === 'completed') {
-          addLog('ICE CONECTADO! Esperando stream...')
-        }
-      }
-      callPeerConn.onicecandidate = (e) => {
-        if (e.candidate) {
-          addLog('ICE candidate: ' + e.candidate.type + ' ' + e.candidate.address)
-        } else {
-          addLog('ICE candidates completados')
-        }
-      }
-    } else {
-      addLog('AVISO: peerConnection no disponible')
-    }
-
-    const handleStream = (remote: MediaStream) => {
-      const tracks = remote.getTracks()
-      addLog('STREAM recibido! ' + tracks.length + ' tracks: ' + tracks.map(t => t.kind + '=' + t.readyState).join(', '))
-
-      const container = videoContainerRef.current
-      if (!container) {
-        addLog('container NULL, retry 500ms')
-        setTimeout(() => handleStream(remote), 500)
-        return
-      }
-
-      if (dynRemoteVideoRef.current && dynRemoteVideoRef.current.parentNode) {
-        dynRemoteVideoRef.current.parentNode.removeChild(dynRemoteVideoRef.current)
-      }
-
-      const video = document.createElement('video')
-      video.id = 'camaraml-remote'
-      video.autoplay = true
-      video.muted = true
-      video.playsInline = true
-      video.setAttribute('playsinline', '')
-      video.setAttribute('autoplay', '')
-      video.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;object-fit:contain;z-index:1;background:#000;'
-      video.srcObject = remote
-      dynRemoteVideoRef.current = video
-
-      container.appendChild(video)
-      addLog('Video creado en DOM')
-
-      const tryPlay = () => {
-        video.play().then(() => {
-          addLog('play() OK vw=' + video.videoWidth + ' vh=' + video.videoHeight)
-        }).catch(e => {
-          addLog('play fail: ' + e.message)
-        })
-      }
-
-      video.onloadedmetadata = () => { addLog('metadata: ' + video.videoWidth + 'x' + video.videoHeight); tryPlay() }
-      video.onloadeddata = () => {
-        addLog('data loaded: ' + video.videoWidth + 'x' + video.videoHeight)
-        if (video.videoWidth > 0) { setStreamActive(true); setConnectionError(''); addLog('VIDEO OK!!!') }
-      }
-      video.onresize = () => {
-        addLog('resize: ' + video.videoWidth + 'x' + video.videoHeight)
-        if (video.videoWidth > 0) { setStreamActive(true); setConnectionError('') }
-      }
-      video.onpause = () => { addLog('video paused! retrying...'); tryPlay() }
-      video.onerror = (e) => {
-        const err = (e.target as HTMLVideoElement).error
-        addLog('VIDEO ERROR: ' + (err ? err.code + ' ' + err.message : 'unknown'))
-      }
-
-      tracks.forEach(track => {
-        track.onended = () => { addLog('Track ended: ' + track.kind); setStreamActive(false) }
-        track.onmute = () => addLog('Track muted: ' + track.kind)
-        track.onunmute = () => addLog('Track unmuted: ' + track.kind)
+        // Step 2: Tell broadcaster our peer ID so they can call us
+        dataConn.send({ type: 'join', peerId: peer.id })
+        setStatusText('Solicitando video, esperando llamada...')
       })
 
-      tryPlay()
+      dataConn.on('error', (err) => {
+        addLog('Data conn error: ' + err)
+        setStatusText('Error en canal de datos')
+        setConnectionError('Error de conexion de datos.')
+      })
 
-      setTimeout(() => { if (video.videoWidth === 0 && video.srcObject) { addLog('No video 1s'); tryPlay() } }, 1000)
-      setTimeout(() => { if (video.videoWidth === 0 && video.srcObject) { addLog('No video 3s'); tryPlay() } }, 3000)
-      setTimeout(() => { if (video.videoWidth === 0 && video.srcObject) { addLog('No video 5s'); tryPlay() } }, 5000)
+      dataConn.on('close', () => {
+        addLog('Data conn cerrada')
+        setStreamActive(false)
+      })
+
+      // Timeout: if no stream in 15s
       setTimeout(() => {
-        if (video.videoWidth === 0) {
-          addLog('STILL NO VIDEO after 8s:')
-          remote.getTracks().forEach(t => addLog('  ' + t.kind + ' ready=' + t.readyState + ' enabled=' + t.enabled + ' muted=' + t.muted))
+        if (!streamActive) {
+          addLog('TIMEOUT 15s sin stream')
+          setStatusText('Tiempo agotado. Reintentando...')
+          setConnectionError('No se recibio video. Verifica que el emisor esta activo.')
         }
-      }, 8000)
-    }
+      }, 15000)
+    })
 
-    call.on('stream', handleStream)
-    call.on('close', () => { setStreamActive(false); setConnectionError('Emisor cerro la transmision.') })
-    call.on('error', err => { setStreamActive(false); setConnectionError('Error de video.'); addLog('Call err: ' + err) })
-    call.on('iceStateChanged', (state: string) => { addLog('ICE: ' + state) })
+    // Step 3: Broadcaster will call us — receive the call and get the stream
+    peer.on('call', (call) => {
+      addLog('!!! LLAMADA RECIBIDA del emisor: ' + call.peer)
+      setStatusText('Llamada recibida! Estableciendo video...')
 
-    setTimeout(() => {
-      if (!streamActive && peerRef.current && !peerRef.current.destroyed) {
-        addLog('RETRY: no stream, calling again...')
-        try {
-          const rc = peer.call(pid, dummyStream)
-          if (rc) { rc.on('stream', handleStream); rc.on('error', () => { setConnectionError('Error reconectar.') }) }
-        } catch (e: any) { addLog('Retry err: ' + e.message) }
+      // Answer the call (we don't need to send any stream back)
+      // But some browsers need at least an empty stream to answer
+      const emptyStream = new MediaStream()
+      call.answer(emptyStream)
+
+      // Monitor ICE
+      const pc = call.peerConnection
+      if (pc) {
+        pc.oniceconnectionstatechange = () => {
+          const s = pc.iceConnectionState
+          addLog('Viewer ICE: ' + s)
+          setStatusText('ICE: ' + s)
+          if (s === 'failed') {
+            setConnectionError('La conexion ICE fallo. Intenta con ambos dispositivos en WiFi.')
+            setStatusText('Fallo ICE')
+          }
+          if (s === 'connected' || s === 'completed') {
+            setStatusText('Conectado! Esperando video...')
+          }
+        }
+        pc.onicecandidate = (e) => {
+          if (e.candidate) {
+            addLog('ICE candidate: ' + e.candidate.type + ' ' + (e.candidate.address || ''))
+          } else {
+            addLog('ICE candidates completados')
+            setStatusText('Negociacion completada, esperando video...')
+          }
+        }
       }
-    }, 8000)
+
+      call.on('stream', (remoteStream) => {
+        addLog('!!! STREAM RECIBIDO del emisor !!!')
+        const tracks = remoteStream.getTracks()
+        addLog(tracks.length + ' tracks: ' + tracks.map(t => t.kind + ' ' + t.readyState).join(', '))
+        setStatusText('Stream recibido! ' + tracks.length + ' tracks')
+
+        // Create video in DOM
+        const container = videoContainerRef.current
+        if (!container) {
+          addLog('container NULL')
+          setStatusText('Error: contenedor no encontrado')
+          return
+        }
+
+        // Remove old
+        if (dynRemoteVideoRef.current && dynRemoteVideoRef.current.parentNode) {
+          dynRemoteVideoRef.current.parentNode.removeChild(dynRemoteVideoRef.current)
+        }
+
+        const video = document.createElement('video')
+        video.autoplay = true
+        video.muted = true
+        video.playsInline = true
+        video.setAttribute('playsinline', '')
+        video.setAttribute('autoplay', '')
+        video.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;object-fit:contain;z-index:1;background:#000;'
+        video.srcObject = remoteStream
+        dynRemoteVideoRef.current = video
+        container.appendChild(video)
+
+        addLog('Video creado en DOM')
+
+        const tryPlay = () => {
+          video.play().then(() => {
+            addLog('play() OK vw=' + video.videoWidth + ' vh=' + video.videoHeight)
+            setStatusText('Reproduciendo: ' + video.videoWidth + 'x' + video.videoHeight)
+          }).catch(e => {
+            addLog('play fail: ' + e.message)
+          })
+        }
+
+        video.onloadedmetadata = () => {
+          addLog('metadata: ' + video.videoWidth + 'x' + video.videoHeight)
+          setStatusText('Metadata cargada: ' + video.videoWidth + 'x' + video.videoHeight)
+          tryPlay()
+        }
+
+        video.onloadeddata = () => {
+          addLog('data: ' + video.videoWidth + 'x' + video.videoHeight)
+          if (video.videoWidth > 0) {
+            setStreamActive(true)
+            setConnectionError('')
+            setStatusText('TRANSMISION ACTIVA')
+            addLog('=== VIDEO FUNCIONANDO ===')
+            // Unmute after a moment
+            setTimeout(() => { video.muted = false; setIsMuted(false) }, 1000)
+          }
+        }
+
+        video.onresize = () => {
+          if (video.videoWidth > 0) {
+            setStreamActive(true)
+            setConnectionError('')
+            setStatusText('TRANSMISION ACTIVA ' + video.videoWidth + 'x' + video.videoHeight)
+          }
+        }
+
+        video.onpause = () => { tryPlay() }
+        video.onerror = (e) => {
+          const err = (e.target as HTMLVideoElement).error
+          addLog('VIDEO ERR: ' + (err ? err.code + ' ' + err.message : '?'))
+          setStatusText('Error de video: ' + (err ? err.message : ''))
+        }
+
+        tracks.forEach(track => {
+          track.onended = () => { addLog('Track ended: ' + track.kind); setStreamActive(false) }
+          track.onmute = () => addLog('Track muted: ' + track.kind)
+          track.onunmute = () => addLog('Track unmute: ' + track.kind)
+        })
+
+        tryPlay()
+
+        // Retry play if no video after delays
+        setTimeout(() => { if (video.videoWidth === 0 && video.srcObject) tryPlay() }, 1000)
+        setTimeout(() => { if (video.videoWidth === 0 && video.srcObject) tryPlay() }, 3000)
+        setTimeout(() => {
+          if (video.videoWidth === 0) {
+            addLog('SIN VIDEO tras 8s. Tracks:')
+            remoteStream.getTracks().forEach(t => addLog('  ' + t.kind + ' ready=' + t.readyState + ' en=' + t.enabled))
+            setStatusText('Track recibida pero sin frames. Ready=' + (tracks[0]?.readyState || '?'))
+          }
+        }, 8000)
+      })
+
+      call.on('close', () => {
+        addLog('Call cerrada')
+        setStreamActive(false)
+        setConnectionError('El emisor cerro la transmision.')
+        setStatusText('Transmision terminada')
+      })
+
+      call.on('error', (err) => {
+        addLog('Call error: ' + err)
+        setStreamActive(false)
+        setConnectionError('Error en la llamada.')
+        setStatusText('Error en llamada')
+      })
+    })
+
+    peer.on('error', (err) => {
+      addLog('Viewer peer err: ' + err.type)
+      if (err.type === 'peer-unavailable') {
+        setConnectionError('Sala no encontrada. Verifica el codigo.')
+        setStatusText('Sala no encontrada')
+      } else {
+        setConnectionError('Error: ' + err.type)
+        setStatusText('Error: ' + err.type)
+      }
+    })
+
+    peer.on('disconnected', () => {
+      setPeerStatus('disconnected')
+      setStreamActive(false)
+      setConnectionError('Desconectado.')
+      setStatusText('Desconectado del servidor')
+      peer.reconnect()
+    })
   }
 
+  // ============ RECORDING ============
   const toggleRecording = () => {
     const s = localStreamRef.current; if (!s) return
     if (!isRecording) {
@@ -340,6 +443,7 @@ export default function CamaraML() {
     }
   }
 
+  // ============ CLEANUP ============
   const cleanup = () => {
     activeCallsRef.current.forEach(c => c.close()); activeCallsRef.current.clear()
     activeDataConnsRef.current.forEach(c => c.close()); activeDataConnsRef.current.clear()
@@ -355,7 +459,7 @@ export default function CamaraML() {
     }
     setStreamActive(false); setViewerCount(0); setConnectionError(''); setRoomId('')
     setViewMode('landing'); setRecordingTime(0); setPeerStatus('disconnected'); setCameraError('')
-    setIsMuted(true)
+    setIsMuted(true); setStatusText('')
     const peer = new Peer(undefined, { debug: 0 }); peerRef.current = peer
     peer.on('open', () => setPeerStatus('connected'))
     peer.on('disconnected', () => setPeerStatus('disconnected'))
@@ -381,6 +485,7 @@ export default function CamaraML() {
     return h > 0 ? `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(sec).padStart(2,'0')}` : `${String(m).padStart(2,'0')}:${String(sec).padStart(2,'0')}`
   }
 
+  // ============ RENDER ============
   return (
     <div className="min-h-screen flex flex-col">
 
@@ -413,10 +518,10 @@ export default function CamaraML() {
                 </div>
               )}
               {localStreamRef.current && viewMode === 'broadcast' && (
-                <Badge variant="destructive" className="animate-pulse"><CircleAlert className="w-3 h-3 mr-1" />EN VIVO</Badge>
+                <Badge variant="destructive" className="animate-pulse">EN VIVO</Badge>
               )}
               {streamActive && viewMode === 'watch' && (
-                <Badge variant="destructive" className="animate-pulse"><CircleAlert className="w-3 h-3 mr-1" />EN VIVO</Badge>
+                <Badge variant="destructive" className="animate-pulse">EN VIVO</Badge>
               )}
             </div>
           </div>
@@ -443,13 +548,8 @@ export default function CamaraML() {
             <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/80" style={{ zIndex: 10 }}>
               <Loader2 className="w-12 h-12 text-emerald-500 animate-spin mb-4" />
               <p className="text-white text-sm">Conectando con el emisor...</p>
-              <p className="text-white/50 text-xs mt-2">Esto puede tardar unos segundos</p>
-              <button
-                className="mt-4 text-white/40 text-[10px] underline hover:text-white/60"
-                onClick={() => { addLog('=== DIAG ==='); const v = dynRemoteVideoRef.current; addLog('dynVideo=' + !!v); if (v) addLog('vw=' + v.videoWidth + ' src=' + !!v.srcObject) }}
-              >
-                Diagnosticar
-              </button>
+              {statusText && <p className="text-white/60 text-xs mt-2">{statusText}</p>}
+              <p className="text-white/30 text-[10px] mt-4">La consola (F12) muestra mas detalle con [CamaraML]</p>
             </div>
           )}
 
@@ -457,6 +557,7 @@ export default function CamaraML() {
             <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/80" style={{ zIndex: 10 }}>
               <CircleAlert className="w-12 h-12 text-amber-500 mb-4" />
               <p className="text-white font-medium text-center px-4">{connectionError}</p>
+              {statusText && <p className="text-white/50 text-xs mt-2">{statusText}</p>}
               <div className="flex gap-2 mt-4">
                 <Button variant="outline" onClick={retryConnection}><RefreshCw className="w-4 h-4 mr-2" />Reintentar</Button>
                 <Button variant="outline" onClick={cleanup}>Volver</Button>
@@ -498,7 +599,7 @@ export default function CamaraML() {
 
           {viewMode === 'watch' && streamActive && (
             <div className="absolute top-4 right-4 flex items-center gap-2" style={{ zIndex: 10 }}>
-              <Badge variant="destructive" className="bg-red-600"><CircleAlert className="w-3 h-3 mr-1" />LIVE</Badge>
+              <Badge variant="destructive" className="bg-red-600">LIVE</Badge>
               <button onClick={toggleMute} className="bg-black/60 hover:bg-black/80 text-white rounded-full p-2">
                 {isMuted ? <VolumeX className="w-4 h-4" /> : <Volume2 className="w-4 h-4" />}
               </button>
@@ -644,6 +745,7 @@ export default function CamaraML() {
                     <><span className="w-2.5 h-2.5 rounded-full bg-muted-foreground animate-pulse inline-block" /><span className="text-muted-foreground">Conectando...</span></>
                   )}
                 </div>
+                {statusText && <span className="text-xs text-muted-foreground/60">{statusText}</span>}
                 <div className="flex items-center gap-2 text-muted-foreground">
                   <MonitorPlay className="w-4 h-4" />
                   <span>Sala: <span className="font-mono font-bold text-foreground">{roomId}</span></span>
