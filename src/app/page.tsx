@@ -11,6 +11,8 @@ import {
   Shield, Clock, Users, CircleAlert, CircleStop,
   Download, ArrowLeft, Maximize2, Minimize2,
   Loader2, Settings, RefreshCw, Volume2, VolumeX,
+  ZoomIn, ZoomOut, ChevronUp, ChevronDown, ChevronLeft, ChevronRight,
+  Mic, MicOff, Bell, BellOff, Signal, CircleDot,
 } from 'lucide-react'
 
 type ViewMode = 'landing' | 'broadcast' | 'watch'
@@ -35,6 +37,7 @@ const ICE_SERVERS = [
 ]
 
 export default function CamaraML() {
+  // ===================== STATE =====================
   const [viewMode, setViewMode] = useState<ViewMode>('landing')
   const [peerStatus, setPeerStatus] = useState<'disconnected' | 'connecting' | 'connected'>('disconnected')
   const [selectedQuality, setSelectedQuality] = useState<VideoQuality>('1080p')
@@ -51,6 +54,17 @@ export default function CamaraML() {
   const [isMuted, setIsMuted] = useState(true)
   const [statusText, setStatusText] = useState('')
 
+  // New features state
+  const [showTimestamp, setShowTimestamp] = useState(true)
+  const [currentTime, setCurrentTime] = useState('')
+  const [zoomLevel, setZoomLevel] = useState(1)
+  const [isMicActive, setIsMicActive] = useState(false)
+  const [soundEnabled, setSoundEnabled] = useState(true)
+  const [viewerRecording, setViewerRecording] = useState(false)
+  const [viewerRecTime, setViewerRecTime] = useState(0)
+  const [connStats, setConnStats] = useState({ rtt: 0, bitrate: 0, packetsLost: 0 })
+
+  // ===================== REFS =====================
   const localStreamRef = useRef<MediaStream | null>(null)
   const mediaRecorderRef = useRef<MediaRecorder | null>(null)
   const recordedChunksRef = useRef<Blob[]>([])
@@ -62,12 +76,60 @@ export default function CamaraML() {
   const localVideoRef = useRef<HTMLVideoElement>(null)
   const dynRemoteVideoRef = useRef<HTMLVideoElement | null>(null)
 
+  // New feature refs
+  const micStreamRef = useRef<MediaStream | null>(null)
+  const outgoingCallRef = useRef<MediaConnection | null>(null)
+  const remoteStreamRef = useRef<MediaStream | null>(null)
+  const viewerPcRef = useRef<RTCPeerConnection | null>(null)
+  const statsIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const prevBytesRef = useRef(0)
+  const viewerAudioElementsRef = useRef<Map<string, HTMLAudioElement>>(new Map())
+  const viewerMediaRecorderRef = useRef<MediaRecorder | null>(null)
+  const viewerChunksRef = useRef<Blob[]>([])
+  const viewerRecIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const zoomRef = useRef(1)
+  const panXRef = useRef(0)
+  const panYRef = useRef(0)
+  const soundEnabledRef = useRef(true)
+
   const isReady = peerStatus === 'connected'
 
+  // ===================== UTILITIES =====================
   const addLog = useCallback((msg: string) => {
     console.log('[CamaraML]', msg)
   }, [])
 
+  const playSound = useCallback((type: 'in' | 'out') => {
+    if (!soundEnabledRef.current) return
+    try {
+      const ctx = new AudioContext()
+      const osc = ctx.createOscillator()
+      const gain = ctx.createGain()
+      osc.connect(gain)
+      gain.connect(ctx.destination)
+      osc.frequency.value = type === 'in' ? 880 : 440
+      osc.type = type === 'in' ? 'sine' : 'triangle'
+      gain.gain.setValueAtTime(0.15, ctx.currentTime)
+      gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.2)
+      osc.start(ctx.currentTime)
+      osc.stop(ctx.currentTime + 0.2)
+    } catch {}
+  }, [])
+
+  const generateRoomId = (): string => {
+    const c = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
+    let r = ''
+    for (let i = 0; i < 6; i++) r += c.charAt(Math.floor(Math.random() * c.length))
+    return r
+  }
+
+  const formatTime = (s: number) => {
+    const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60
+    return h > 0 ? `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}` : `${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}`
+  }
+
+  // ===================== EFFECTS =====================
+  // Peer initialization
   useEffect(() => {
     const peer = new Peer(undefined, { debug: 0 })
     peerRef.current = peer
@@ -77,16 +139,169 @@ export default function CamaraML() {
     return () => { peer.destroy(); peerRef.current = null }
   }, [addLog])
 
-  const generateRoomId = (): string => {
-    const c = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
-    let r = ''
-    for (let i = 0; i < 6; i++) r += c.charAt(Math.floor(Math.random() * c.length))
-    return r
-  }
+  // Timestamp updater - runs every second
+  useEffect(() => {
+    const update = () => {
+      const now = new Date()
+      setCurrentTime(now.toLocaleString('es-ES', {
+        year: 'numeric', month: '2-digit', day: '2-digit',
+        hour: '2-digit', minute: '2-digit', second: '2-digit',
+      }))
+    }
+    update()
+    const interval = setInterval(update, 1000)
+    return () => clearInterval(interval)
+  }, [])
 
-  // =============================================
-  // BROADCAST: Camera → viewer (broadcaster CALLS viewer)
-  // =============================================
+  // Stats polling for viewer - starts when stream is active
+  useEffect(() => {
+    if (viewMode !== 'watch' || !streamActive) {
+      if (statsIntervalRef.current) {
+        clearInterval(statsIntervalRef.current)
+        statsIntervalRef.current = null
+      }
+      return
+    }
+
+    prevBytesRef.current = 0
+    statsIntervalRef.current = setInterval(async () => {
+      const pc = viewerPcRef.current
+      if (!pc) return
+      try {
+        const stats = await pc.getStats()
+        let rtt = 0, packetsLost = 0, bytesReceived = 0
+        stats.forEach((report: any) => {
+          if (report.type === 'inbound-rtp' && report.kind === 'video') {
+            packetsLost = report.packetsLost || 0
+            bytesReceived = report.bytesReceived || 0
+          }
+          if (report.type === 'candidate-pair' && report.state === 'succeeded') {
+            rtt = report.currentRoundTripTime || 0
+          }
+        })
+        const prev = prevBytesRef.current
+        const bitrate = prev > 0 ? Math.round(((bytesReceived - prev) * 4) / 1000) : 0
+        prevBytesRef.current = bytesReceived
+        setConnStats({ rtt: Math.round(rtt * 1000), bitrate, packetsLost })
+      } catch {}
+    }, 2000)
+
+    return () => {
+      if (statsIntervalRef.current) {
+        clearInterval(statsIntervalRef.current)
+        statsIntervalRef.current = null
+      }
+    }
+  }, [viewMode, streamActive])
+
+  // ===================== ZOOM / PAN =====================
+  const applyVideoTransform = useCallback(() => {
+    const t = `translate(${panXRef.current}px, ${panYRef.current}px) scale(${zoomRef.current})`
+    if (dynRemoteVideoRef.current) dynRemoteVideoRef.current.style.transform = t
+    if (localVideoRef.current) localVideoRef.current.style.transform = t
+  }, [])
+
+  const handleZoomChange = useCallback((val: number) => {
+    const newZoom = Math.max(1, Math.min(5, val))
+    zoomRef.current = newZoom
+    setZoomLevel(newZoom)
+    applyVideoTransform()
+  }, [applyVideoTransform])
+
+  const handlePan = useCallback((dx: number, dy: number) => {
+    panXRef.current -= dx * 25
+    panYRef.current -= dy * 25
+    applyVideoTransform()
+  }, [applyVideoTransform])
+
+  const resetView = useCallback(() => {
+    zoomRef.current = 1
+    panXRef.current = 0
+    panYRef.current = 0
+    setZoomLevel(1)
+    applyVideoTransform()
+  }, [applyVideoTransform])
+
+  // ===================== MIC (viewer talks to broadcaster) =====================
+  const toggleViewerMic = useCallback(async () => {
+    if (isMicActive) {
+      micStreamRef.current?.getTracks().forEach(t => t.stop())
+      micStreamRef.current = null
+      if (outgoingCallRef.current) {
+        outgoingCallRef.current.close()
+        outgoingCallRef.current = null
+      }
+      setIsMicActive(false)
+      addLog('Mic desactivado')
+      return
+    }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      micStreamRef.current = stream
+      const peer = peerRef.current
+      if (!peer) { stream.getTracks().forEach(t => t.stop()); return }
+      const call = peer.call(`${PEER_PREFIX}${roomId}`, stream)
+      if (call) {
+        outgoingCallRef.current = call
+        setIsMicActive(true)
+        addLog('Mic activado, enviando audio al emisor')
+        call.on('close', () => {
+          setIsMicActive(false)
+          micStreamRef.current?.getTracks().forEach(t => t.stop())
+          micStreamRef.current = null
+          outgoingCallRef.current = null
+          addLog('Mic call cerrada')
+        })
+        call.on('error', () => {
+          setIsMicActive(false)
+          micStreamRef.current?.getTracks().forEach(t => t.stop())
+          micStreamRef.current = null
+        })
+      }
+    } catch (e: any) {
+      addLog('Mic error: ' + e.message)
+    }
+  }, [isMicActive, roomId, addLog])
+
+  // ===================== VIEWER RECORDING =====================
+  const toggleViewerRecording = useCallback(() => {
+    const s = remoteStreamRef.current
+    if (!s) { addLog('No hay stream para grabar'); return }
+    if (!viewerRecording) {
+      let mime = 'video/webm'
+      if (MediaRecorder.isTypeSupported('video/webm;codecs=vp9,opus')) mime = 'video/webm;codecs=vp9,opus'
+      else if (MediaRecorder.isTypeSupported('video/webm;codecs=vp8,opus')) mime = 'video/webm;codecs=vp8,opus'
+      const rec = new MediaRecorder(s, { mimeType: mime })
+      viewerChunksRef.current = []
+      rec.ondataavailable = e => { if (e.data.size > 0) viewerChunksRef.current.push(e.data) }
+      rec.onstop = () => {
+        const blob = new Blob(viewerChunksRef.current, { type: 'video/webm' })
+        const url = URL.createObjectURL(blob)
+        const a = document.createElement('a')
+        a.href = url
+        a.download = `CamaraML_viewer_${roomId}_${Date.now()}.webm`
+        document.body.appendChild(a)
+        a.click()
+        document.body.removeChild(a)
+        URL.revokeObjectURL(url)
+        viewerChunksRef.current = []
+        addLog('Grabacion del espectador descargada')
+      }
+      rec.start(1000)
+      viewerMediaRecorderRef.current = rec
+      setViewerRecording(true)
+      setViewerRecTime(0)
+      viewerRecIntervalRef.current = setInterval(() => setViewerRecTime(p => p + 1), 1000)
+      addLog('Grabacion del espectador iniciada')
+    } else {
+      viewerMediaRecorderRef.current?.stop()
+      setViewerRecording(false)
+      if (viewerRecIntervalRef.current) { clearInterval(viewerRecIntervalRef.current); viewerRecIntervalRef.current = null }
+      setViewerRecTime(0)
+    }
+  }, [viewerRecording, roomId, addLog])
+
+  // ===================== BROADCASTER =====================
   const startBroadcasting = async () => {
     setCameraError('')
     addLog('=== TRANSMISION ===')
@@ -132,14 +347,16 @@ export default function CamaraML() {
 
     peer.on('open', () => addLog('Broadcaster listo: ' + peer.id))
 
-    // *** KEY CHANGE: When a viewer connects via data, BROADCASTER calls the viewer ***
+    // When a viewer connects via data, broadcaster CALLS the viewer with video
     peer.on('connection', (conn) => {
       addLog('Viewer conectado (data): ' + conn.peer)
       activeDataConnsRef.current.set(conn.peer, conn)
 
+      conn.on('open', () => {
+        playSound('in')
+      })
+
       conn.on('data', (data) => {
-        addLog('Mensaje del viewer: ' + JSON.stringify(data))
-        // Viewer says "join" with their peer ID — call them with our stream!
         if (data && data.type === 'join') {
           addLog('Llamando al viewer ' + conn.peer + ' con stream...')
           try {
@@ -149,10 +366,17 @@ export default function CamaraML() {
               activeCallsRef.current.set(conn.peer, call)
               setViewerCount(activeCallsRef.current.size)
 
-              call.on('close', () => { activeCallsRef.current.delete(conn.peer); setViewerCount(activeCallsRef.current.size) })
-              call.on('error', (err) => { addLog('Call error: ' + err); activeCallsRef.current.delete(conn.peer); setViewerCount(activeCallsRef.current.size) })
+              call.on('close', () => {
+                activeCallsRef.current.delete(conn.peer)
+                setViewerCount(activeCallsRef.current.size)
+                playSound('out')
+              })
+              call.on('error', (err) => {
+                addLog('Call error: ' + err)
+                activeCallsRef.current.delete(conn.peer)
+                setViewerCount(activeCallsRef.current.size)
+              })
 
-              // Monitor ICE
               const pc = call.peerConnection
               if (pc) {
                 pc.oniceconnectionstatechange = () => {
@@ -168,19 +392,49 @@ export default function CamaraML() {
         }
       })
 
-      conn.on('close', () => { activeDataConnsRef.current.delete(conn.peer); setViewerCount(Math.max(0, activeCallsRef.current.size - 1)) })
+      conn.on('close', () => {
+        activeDataConnsRef.current.delete(conn.peer)
+        setViewerCount(Math.max(0, activeCallsRef.current.size))
+        playSound('out')
+      })
       conn.on('error', () => { activeDataConnsRef.current.delete(conn.peer) })
     })
 
-    // Also handle legacy direct calls (backward compat)
+    // Handle incoming calls (mic from viewers, or legacy video calls)
     peer.on('call', (call) => {
-      addLog('Llamada directa recibida de: ' + call.peer)
+      addLog('Llamada recibida de: ' + call.peer)
       call.answer(stream)
+
+      call.on('stream', (remoteStream) => {
+        const hasVideo = remoteStream.getVideoTracks().length > 0
+        if (!hasVideo) {
+          // This is a mic call from a viewer - play audio only
+          addLog('Audio de mic recibido de viewer: ' + call.peer)
+          const audio = new Audio()
+          audio.srcObject = remoteStream
+          audio.play().catch(() => {})
+          viewerAudioElementsRef.current.set(call.peer, audio)
+        }
+      })
+
       activeCallsRef.current.set(call.peer, call)
       setViewerCount(activeCallsRef.current.size)
+
       call.on('stream', () => {})
-      call.on('close', () => { activeCallsRef.current.delete(call.peer); setViewerCount(activeCallsRef.current.size) })
-      call.on('error', () => { activeCallsRef.current.delete(call.peer); setViewerCount(activeCallsRef.current.size) })
+      call.on('close', () => {
+        // Stop viewer audio if any
+        const audio = viewerAudioElementsRef.current.get(call.peer)
+        if (audio) { audio.pause(); audio.srcObject = null; viewerAudioElementsRef.current.delete(call.peer) }
+        activeCallsRef.current.delete(call.peer)
+        setViewerCount(activeCallsRef.current.size)
+        playSound('out')
+      })
+      call.on('error', () => {
+        const audio = viewerAudioElementsRef.current.get(call.peer)
+        if (audio) { audio.pause(); audio.srcObject = null; viewerAudioElementsRef.current.delete(call.peer) }
+        activeCallsRef.current.delete(call.peer)
+        setViewerCount(activeCallsRef.current.size)
+      })
     })
 
     peer.on('error', (err) => {
@@ -190,9 +444,7 @@ export default function CamaraML() {
     peer.on('disconnected', () => { setPeerStatus('disconnected'); peer.reconnect() })
   }
 
-  // =============================================
-  // VIEWER: Connects via data, receives call from broadcaster
-  // =============================================
+  // ===================== VIEWER =====================
   const joinAsViewer = () => {
     const code = joinRoomInput.trim().toUpperCase()
     if (code.length < 4) return
@@ -202,6 +454,7 @@ export default function CamaraML() {
     setStreamActive(false)
     setIsMuted(true)
     setStatusText('Conectando...')
+    setConnStats({ rtt: 0, bitrate: 0, packetsLost: 0 })
     addLog('Viewer uniendose a: ' + code)
 
     if (peerRef.current) peerRef.current.destroy()
@@ -219,15 +472,12 @@ export default function CamaraML() {
 
       const pid = `${PEER_PREFIX}${code}`
 
-      // Step 1: Open data connection to broadcaster
       setStatusText('Abriendo canal de datos...')
       const dataConn = peer.connect(pid, { reliable: true })
 
       dataConn.on('open', () => {
         addLog('Data connection ABIERTA')
         setStatusText('Canal abierto, solicitando video...')
-
-        // Step 2: Tell broadcaster our peer ID so they can call us
         dataConn.send({ type: 'join', peerId: peer.id })
         setStatusText('Solicitando video, esperando llamada...')
       })
@@ -243,7 +493,6 @@ export default function CamaraML() {
         setStreamActive(false)
       })
 
-      // Timeout: if no stream in 15s
       setTimeout(() => {
         if (!streamActive) {
           addLog('TIMEOUT 15s sin stream')
@@ -253,15 +502,33 @@ export default function CamaraML() {
       }, 15000)
     })
 
-    // Step 3: Broadcaster will call us — receive the call and get the stream
+    // Broadcaster will call us - receive the call and get the stream
     peer.on('call', (call) => {
       addLog('!!! LLAMADA RECIBIDA del emisor: ' + call.peer)
       setStatusText('Llamada recibida! Estableciendo video...')
 
-      // Answer the call (we don't need to send any stream back)
-      // But some browsers need at least an empty stream to answer
+      // Check if it's our main video call (from broadcaster)
+      const remotePeer = call.peer
+      const isMainCall = remotePeer.startsWith(PEER_PREFIX)
+
+      if (!isMainCall) {
+        // Not the main broadcaster - answer with empty stream
+        const emptyStream = new MediaStream()
+        call.answer(emptyStream)
+        call.on('stream', (s) => {
+          const hasVideo = s.getVideoTracks().length > 0
+          if (!hasVideo) {
+            addLog('Audio recibido (non-main call)')
+          }
+        })
+        return
+      }
+
       const emptyStream = new MediaStream()
       call.answer(emptyStream)
+
+      // Save PC ref for stats
+      viewerPcRef.current = call.peerConnection
 
       // Monitor ICE
       const pc = call.peerConnection
@@ -294,6 +561,9 @@ export default function CamaraML() {
         addLog(tracks.length + ' tracks: ' + tracks.map(t => t.kind + ' ' + t.readyState).join(', '))
         setStatusText('Stream recibido! ' + tracks.length + ' tracks')
 
+        // Save remote stream ref for recording
+        remoteStreamRef.current = remoteStream
+
         // Create video in DOM
         const container = videoContainerRef.current
         if (!container) {
@@ -302,7 +572,7 @@ export default function CamaraML() {
           return
         }
 
-        // Remove old
+        // Remove old remote video
         if (dynRemoteVideoRef.current && dynRemoteVideoRef.current.parentNode) {
           dynRemoteVideoRef.current.parentNode.removeChild(dynRemoteVideoRef.current)
         }
@@ -314,6 +584,8 @@ export default function CamaraML() {
         video.setAttribute('playsinline', '')
         video.setAttribute('autoplay', '')
         video.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;object-fit:contain;z-index:1;background:#000;'
+        // Apply current zoom/pan
+        video.style.transform = `translate(${panXRef.current}px, ${panYRef.current}px) scale(${zoomRef.current})`
         video.srcObject = remoteStream
         dynRemoteVideoRef.current = video
         container.appendChild(video)
@@ -342,6 +614,7 @@ export default function CamaraML() {
             setConnectionError('')
             setStatusText('TRANSMISION ACTIVA')
             addLog('=== VIDEO FUNCIONANDO ===')
+            playSound('in')
             // Unmute after a moment
             setTimeout(() => { video.muted = false; setIsMuted(false) }, 1000)
           }
@@ -370,14 +643,13 @@ export default function CamaraML() {
 
         tryPlay()
 
-        // Retry play if no video after delays
         setTimeout(() => { if (video.videoWidth === 0 && video.srcObject) tryPlay() }, 1000)
         setTimeout(() => { if (video.videoWidth === 0 && video.srcObject) tryPlay() }, 3000)
         setTimeout(() => {
           if (video.videoWidth === 0) {
             addLog('SIN VIDEO tras 8s. Tracks:')
             remoteStream.getTracks().forEach(t => addLog('  ' + t.kind + ' ready=' + t.readyState + ' en=' + t.enabled))
-            setStatusText('Track recibida pero sin frames. Ready=' + (tracks[0]?.readyState || '?'))
+            setStatusText('Track recibida pero sin frames.')
           }
         }, 8000)
       })
@@ -387,6 +659,7 @@ export default function CamaraML() {
         setStreamActive(false)
         setConnectionError('El emisor cerro la transmision.')
         setStatusText('Transmision terminada')
+        playSound('out')
       })
 
       call.on('error', (err) => {
@@ -417,7 +690,7 @@ export default function CamaraML() {
     })
   }
 
-  // ============ RECORDING ============
+  // ===================== BROADCASTER RECORDING =====================
   const toggleRecording = () => {
     const s = localStreamRef.current; if (!s) return
     if (!isRecording) {
@@ -443,23 +716,64 @@ export default function CamaraML() {
     }
   }
 
-  // ============ CLEANUP ============
+  // ===================== CLEANUP =====================
   const cleanup = () => {
     activeCallsRef.current.forEach(c => c.close()); activeCallsRef.current.clear()
     activeDataConnsRef.current.forEach(c => c.close()); activeDataConnsRef.current.clear()
     if (peerRef.current) { peerRef.current.destroy(); peerRef.current = null }
+
+    // Stop local stream
     if (localStreamRef.current) { localStreamRef.current.getTracks().forEach(t => t.stop()); localStreamRef.current = null }
+
+    // Stop broadcaster recording
     if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') mediaRecorderRef.current.stop()
     setIsRecording(false)
     if (recordingIntervalRef.current) { clearInterval(recordingIntervalRef.current); recordingIntervalRef.current = null }
+
+    // Stop viewer mic
+    micStreamRef.current?.getTracks().forEach(t => t.stop())
+    micStreamRef.current = null
+    if (outgoingCallRef.current) { outgoingCallRef.current.close(); outgoingCallRef.current = null }
+    setIsMicActive(false)
+
+    // Stop viewer recording
+    if (viewerMediaRecorderRef.current && viewerMediaRecorderRef.current.state !== 'inactive') viewerMediaRecorderRef.current.stop()
+    if (viewerRecIntervalRef.current) { clearInterval(viewerRecIntervalRef.current); viewerRecIntervalRef.current = null }
+    setViewerRecording(false)
+    setViewerRecTime(0)
+
+    // Stop stats polling
+    if (statsIntervalRef.current) { clearInterval(statsIntervalRef.current); statsIntervalRef.current = null }
+
+    // Clear viewer audio elements (broadcaster side)
+    viewerAudioElementsRef.current.forEach(a => { a.pause(); a.srcObject = null })
+    viewerAudioElementsRef.current.clear()
+
+    // Clear video elements
     if (localVideoRef.current) { localVideoRef.current.srcObject = null; localVideoRef.current.load() }
     if (dynRemoteVideoRef.current && dynRemoteVideoRef.current.parentNode) {
       dynRemoteVideoRef.current.parentNode.removeChild(dynRemoteVideoRef.current)
       dynRemoteVideoRef.current = null
     }
+
+    // Reset refs
+    remoteStreamRef.current = null
+    viewerPcRef.current = null
+    prevBytesRef.current = 0
+
+    // Reset zoom/pan
+    zoomRef.current = 1
+    panXRef.current = 0
+    panYRef.current = 0
+    setZoomLevel(1)
+
+    // Reset states
     setStreamActive(false); setViewerCount(0); setConnectionError(''); setRoomId('')
     setViewMode('landing'); setRecordingTime(0); setPeerStatus('disconnected'); setCameraError('')
     setIsMuted(true); setStatusText('')
+    setConnStats({ rtt: 0, bitrate: 0, packetsLost: 0 })
+
+    // Recreate default peer
     const peer = new Peer(undefined, { debug: 0 }); peerRef.current = peer
     peer.on('open', () => setPeerStatus('connected'))
     peer.on('disconnected', () => setPeerStatus('disconnected'))
@@ -480,15 +794,12 @@ export default function CamaraML() {
       setIsMuted(dynRemoteVideoRef.current.muted)
     }
   }
-  const formatTime = (s: number) => {
-    const h = Math.floor(s/3600), m = Math.floor((s%3600)/60), sec = s%60
-    return h > 0 ? `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(sec).padStart(2,'0')}` : `${String(m).padStart(2,'0')}:${String(sec).padStart(2,'0')}`
-  }
 
-  // ============ RENDER ============
+  // ===================== RENDER =====================
   return (
     <div className="min-h-screen flex flex-col">
 
+      {/* ===== HEADER ===== */}
       {viewMode !== 'landing' && (
         <header className="border-b bg-card/80 backdrop-blur-sm sticky top-0 z-30">
           <div className="max-w-5xl mx-auto px-4 py-3 flex items-center justify-between flex-wrap gap-2">
@@ -523,17 +834,29 @@ export default function CamaraML() {
               {streamActive && viewMode === 'watch' && (
                 <Badge variant="destructive" className="animate-pulse">EN VIVO</Badge>
               )}
+              {/* Sound toggle in header */}
+              <Button
+                variant="ghost"
+                size="icon"
+                className="h-8 w-8"
+                onClick={() => { soundEnabledRef.current = !soundEnabledRef.current; setSoundEnabled(soundEnabledRef.current) }}
+                title={soundEnabled ? 'Desactivar sonidos' : 'Activar sonidos'}
+              >
+                {soundEnabled ? <Bell className="w-4 h-4 text-amber-500" /> : <BellOff className="w-4 h-4 text-muted-foreground" />}
+              </Button>
             </div>
           </div>
         </header>
       )}
 
+      {/* ===== VIDEO CONTAINER ===== */}
       <div className="w-full max-w-5xl mx-auto px-4 pt-4" style={{ display: viewMode !== 'landing' ? 'block' : 'none' }}>
         <div
           ref={videoContainerRef}
           className="relative bg-black rounded-xl overflow-hidden border border-border"
           style={{ width: '100%', height: '65vh', minHeight: '250px' }}
         >
+          {/* Local video (broadcaster) */}
           <video
             ref={localVideoRef}
             autoPlay muted playsInline
@@ -544,15 +867,16 @@ export default function CamaraML() {
             }}
           />
 
+          {/* Viewer connecting overlay */}
           {viewMode === 'watch' && !streamActive && !connectionError && (
             <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/80" style={{ zIndex: 10 }}>
               <Loader2 className="w-12 h-12 text-emerald-500 animate-spin mb-4" />
               <p className="text-white text-sm">Conectando con el emisor...</p>
               {statusText && <p className="text-white/60 text-xs mt-2">{statusText}</p>}
-              <p className="text-white/30 text-[10px] mt-4">La consola (F12) muestra mas detalle con [CamaraML]</p>
             </div>
           )}
 
+          {/* Viewer error overlay */}
           {viewMode === 'watch' && connectionError && (
             <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/80" style={{ zIndex: 10 }}>
               <CircleAlert className="w-12 h-12 text-amber-500 mb-4" />
@@ -565,6 +889,7 @@ export default function CamaraML() {
             </div>
           )}
 
+          {/* Broadcaster loading overlay */}
           {viewMode === 'broadcast' && !localStreamRef.current && !cameraError && (
             <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/80" style={{ zIndex: 10 }}>
               <Loader2 className="w-12 h-12 text-red-500 animate-spin mb-4" />
@@ -572,6 +897,7 @@ export default function CamaraML() {
             </div>
           )}
 
+          {/* Broadcaster error overlay */}
           {viewMode === 'broadcast' && cameraError && (
             <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/80" style={{ zIndex: 10 }}>
               <CircleAlert className="w-12 h-12 text-amber-500 mb-4" />
@@ -583,35 +909,72 @@ export default function CamaraML() {
             </div>
           )}
 
+          {/* Timestamp overlay */}
+          {showTimestamp && (viewMode === 'broadcast' || viewMode === 'watch') && currentTime && (
+            <div
+              className="absolute bottom-4 left-4 bg-black/70 backdrop-blur-sm text-white text-xs font-mono px-2.5 py-1 rounded"
+              style={{ zIndex: 15 }}
+            >
+              {currentTime}
+            </div>
+          )}
+
+          {/* Broadcaster recording indicator */}
           {viewMode === 'broadcast' && isRecording && localStreamRef.current && (
-            <div className="absolute top-4 left-4 flex items-center gap-2 bg-black/70 backdrop-blur-sm rounded-full px-3 py-1.5" style={{ zIndex: 10 }}>
+            <div className="absolute top-4 left-4 flex items-center gap-2 bg-black/70 backdrop-blur-sm rounded-full px-3 py-1.5" style={{ zIndex: 15 }}>
               <div className="w-3 h-3 rounded-full bg-red-500 animate-pulse" />
               <span className="text-white text-sm font-medium">REC {formatTime(recordingTime)}</span>
             </div>
           )}
 
+          {/* Broadcaster LIVE badge */}
           {viewMode === 'broadcast' && localStreamRef.current && (
-            <div className="absolute top-4 right-4 flex items-center gap-2" style={{ zIndex: 10 }}>
+            <div className="absolute top-4 right-4 flex items-center gap-2" style={{ zIndex: 15 }}>
               <Badge variant="destructive" className="bg-red-600">LIVE</Badge>
               <Badge variant="outline" className="bg-black/70 text-white border-white/20 text-xs font-mono">{selectedQuality}</Badge>
             </div>
           )}
 
+          {/* Viewer LIVE + controls overlay */}
           {viewMode === 'watch' && streamActive && (
-            <div className="absolute top-4 right-4 flex items-center gap-2" style={{ zIndex: 10 }}>
+            <div className="absolute top-4 right-4 flex items-center gap-2" style={{ zIndex: 15 }}>
               <Badge variant="destructive" className="bg-red-600">LIVE</Badge>
-              <button onClick={toggleMute} className="bg-black/60 hover:bg-black/80 text-white rounded-full p-2">
+              {/* Viewer recording indicator on video */}
+              {viewerRecording && (
+                <div className="flex items-center gap-1.5 bg-red-600 rounded-full px-2.5 py-1">
+                  <div className="w-2.5 h-2.5 rounded-full bg-white animate-pulse" />
+                  <span className="text-white text-xs font-medium">REC {formatTime(viewerRecTime)}</span>
+                </div>
+              )}
+              {/* Mic indicator on video */}
+              {isMicActive && (
+                <div className="flex items-center gap-1.5 bg-emerald-600 rounded-full px-2.5 py-1">
+                  <Mic className="w-3 h-3 text-white" />
+                  <span className="text-white text-xs font-medium">MIC</span>
+                </div>
+              )}
+              <button onClick={toggleMute} className="bg-black/60 hover:bg-black/80 text-white rounded-full p-2" title={isMuted ? 'Activar sonido' : 'Silenciar'}>
                 {isMuted ? <VolumeX className="w-4 h-4" /> : <Volume2 className="w-4 h-4" />}
               </button>
             </div>
           )}
 
-          <button onClick={toggleFullscreen} className="absolute bottom-4 right-4 bg-black/50 hover:bg-black/70 text-white rounded-full p-2" style={{ zIndex: 10 }}>
+          {/* Connection stats overlay on video (viewer) */}
+          {viewMode === 'watch' && streamActive && connStats.bitrate > 0 && (
+            <div className="absolute bottom-4 right-4 flex items-center gap-3 bg-black/60 backdrop-blur-sm text-white text-[10px] font-mono px-2.5 py-1 rounded" style={{ zIndex: 15 }}>
+              <div className="flex items-center gap-1"><Signal className="w-3 h-3 text-emerald-400" />{connStats.rtt}ms</div>
+              <div>{connStats.bitrate} kbps</div>
+            </div>
+          )}
+
+          {/* Fullscreen button */}
+          <button onClick={toggleFullscreen} className="absolute bottom-4 left-1/2 -translate-x-1/2 bg-black/50 hover:bg-black/70 text-white rounded-full p-2" style={{ zIndex: 15 }}>
             {isFullscreen ? <Minimize2 className="w-5 h-5" /> : <Maximize2 className="w-5 h-5" />}
           </button>
         </div>
       </div>
 
+      {/* ===== LANDING PAGE ===== */}
       {viewMode === 'landing' && (
         <div className="flex-1 flex flex-col items-center justify-center p-4">
           <div className="w-full max-w-lg space-y-8">
@@ -707,6 +1070,7 @@ export default function CamaraML() {
         </div>
       )}
 
+      {/* ===== BROADCASTER CONTROLS ===== */}
       {viewMode === 'broadcast' && (
         <div className="max-w-5xl mx-auto w-full px-4 pb-4 space-y-4">
           <div className="flex flex-wrap items-center gap-3">
@@ -714,6 +1078,15 @@ export default function CamaraML() {
               {isRecording ? <><CircleStop className="w-5 h-5 mr-2" />Detener Grabacion</> : <><div className="w-4 h-4 rounded-full border-2 border-current mr-2" />Iniciar Grabacion</>}
             </Button>
             {isRecording && <div className="flex items-center gap-2 text-muted-foreground text-sm"><Clock className="w-4 h-4" /><span className="font-mono">{formatTime(recordingTime)}</span></div>}
+            {/* Timestamp toggle for broadcaster */}
+            <Button
+              variant={showTimestamp ? 'default' : 'outline'}
+              size="sm"
+              onClick={() => setShowTimestamp(!showTimestamp)}
+            >
+              <Clock className="w-4 h-4 mr-2" />
+              {showTimestamp ? 'Ocultar hora' : 'Mostrar hora'}
+            </Button>
           </div>
           <Card>
             <CardContent className="p-4">
@@ -731,8 +1104,97 @@ export default function CamaraML() {
         </div>
       )}
 
+      {/* ===== VIEWER CONTROLS ===== */}
       {viewMode === 'watch' && (
-        <div className="max-w-5xl mx-auto w-full px-4 pb-4 space-y-4">
+        <div className="max-w-5xl mx-auto w-full px-4 pb-4 space-y-3">
+
+          {/* Zoom and Pan Controls */}
+          <Card>
+            <CardContent className="p-4 space-y-3">
+              {/* Zoom slider */}
+              <div className="flex items-center gap-3">
+                <ZoomOut className="w-4 h-4 text-muted-foreground flex-shrink-0" />
+                <input
+                  type="range" min="1" max="5" step="0.25" value={zoomLevel}
+                  onChange={e => handleZoomChange(parseFloat(e.target.value))}
+                  className="flex-1 h-2 bg-muted rounded-lg appearance-none cursor-pointer accent-emerald-500"
+                />
+                <ZoomIn className="w-4 h-4 text-muted-foreground flex-shrink-0" />
+                <span className="text-xs font-mono text-muted-foreground w-12 text-right">{zoomLevel.toFixed(2)}x</span>
+                <Button variant="ghost" size="sm" onClick={resetView} className="text-xs h-7 px-2">
+                  Reset
+                </Button>
+              </div>
+
+              {/* Direction pad */}
+              <div className="flex items-center gap-4">
+                <div className="grid grid-cols-3 gap-1" style={{ gridTemplateRows: 'auto auto auto' }}>
+                  <div />
+                  <Button variant="outline" size="icon" className="h-8 w-8" onClick={() => handlePan(0, -1)} disabled={zoomLevel <= 1}>
+                    <ChevronUp className="w-4 h-4" />
+                  </Button>
+                  <div />
+                  <Button variant="outline" size="icon" className="h-8 w-8" onClick={() => handlePan(-1, 0)} disabled={zoomLevel <= 1}>
+                    <ChevronLeft className="w-4 h-4" />
+                  </Button>
+                  <Button variant="outline" size="icon" className="h-8 w-8" onClick={() => handlePan(0, 1)} disabled={zoomLevel <= 1}>
+                    <ChevronDown className="w-4 h-4" />
+                  </Button>
+                  <Button variant="outline" size="icon" className="h-8 w-8" onClick={() => handlePan(1, 0)} disabled={zoomLevel <= 1}>
+                    <ChevronRight className="w-4 h-4" />
+                  </Button>
+                </div>
+                <span className="text-[10px] text-muted-foreground/70">Mover camara (requiere zoom)</span>
+              </div>
+            </CardContent>
+          </Card>
+
+          {/* Action Buttons */}
+          <div className="flex flex-wrap gap-2">
+            {/* Mic toggle */}
+            <Button
+              variant={isMicActive ? 'default' : 'outline'}
+              size="sm"
+              onClick={toggleViewerMic}
+              className={isMicActive ? 'bg-emerald-600 hover:bg-emerald-700 text-white' : ''}
+            >
+              {isMicActive ? <><MicOff className="w-4 h-4 mr-2" />Desactivar Mic</> : <><Mic className="w-4 h-4 mr-2" />Activar Mic</>}
+            </Button>
+
+            {/* Viewer recording */}
+            <Button
+              variant={viewerRecording ? 'destructive' : 'outline'}
+              size="sm"
+              onClick={toggleViewerRecording}
+              disabled={!streamActive}
+            >
+              {viewerRecording
+                ? <><CircleStop className="w-4 h-4 mr-2" />Detener ({formatTime(viewerRecTime)})</>
+                : <><CircleDot className="w-4 h-4 mr-2" />Grabar transmision</>
+              }
+            </Button>
+
+            {/* Timestamp toggle */}
+            <Button
+              variant={showTimestamp ? 'default' : 'outline'}
+              size="sm"
+              onClick={() => setShowTimestamp(!showTimestamp)}
+            >
+              <Clock className="w-4 h-4 mr-2" />
+              {showTimestamp ? 'Ocultar hora' : 'Mostrar hora'}
+            </Button>
+
+            {/* Sound toggle */}
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => { soundEnabledRef.current = !soundEnabledRef.current; setSoundEnabled(soundEnabledRef.current) }}
+            >
+              {soundEnabled ? <><Bell className="w-4 h-4 mr-2 text-amber-500" />Sonido On</> : <><BellOff className="w-4 h-4 mr-2" />Sonido Off</>}
+            </Button>
+          </div>
+
+          {/* Connection Quality Stats */}
           <Card>
             <CardContent className="p-4">
               <div className="flex flex-wrap items-center justify-between gap-4 text-sm">
@@ -751,6 +1213,22 @@ export default function CamaraML() {
                   <span>Sala: <span className="font-mono font-bold text-foreground">{roomId}</span></span>
                 </div>
               </div>
+
+              {/* Detailed stats */}
+              {streamActive && (
+                <div className="flex flex-wrap items-center gap-4 mt-3 pt-3 border-t text-xs text-muted-foreground">
+                  <div className="flex items-center gap-1.5">
+                    <Signal className="w-3.5 h-3.5" />
+                    <span>RTT: <span className="font-mono text-foreground">{connStats.rtt}ms</span></span>
+                  </div>
+                  <div>
+                    <span>Bitrate: <span className="font-mono text-foreground">{connStats.bitrate > 0 ? connStats.bitrate + ' kbps' : 'calculando...'}</span></span>
+                  </div>
+                  <div>
+                    <span>Packets lost: <span className="font-mono text-foreground">{connStats.packetsLost}</span></span>
+                  </div>
+                </div>
+              )}
             </CardContent>
           </Card>
         </div>
