@@ -1130,21 +1130,21 @@ export default function CamaraML() {
               <div className="flex items-center gap-4">
                 <div className="grid grid-cols-3 gap-1" style={{ gridTemplateRows: 'auto auto auto' }}>
                   <div />
-                  <Button variant="outline" size="icon" className="h-8 w-8" onClick={() => handlePan(0, -1)} disabled={zoomLevel <= 1}>
+                  <Button variant="outline" size="icon" className="h-8 w-8" onClick={() => handlePan(0, -1)}>
                     <ChevronUp className="w-4 h-4" />
                   </Button>
                   <div />
-                  <Button variant="outline" size="icon" className="h-8 w-8" onClick={() => handlePan(-1, 0)} disabled={zoomLevel <= 1}>
+                  <Button variant="outline" size="icon" className="h-8 w-8" onClick={() => handlePan(-1, 0)}>
                     <ChevronLeft className="w-4 h-4" />
                   </Button>
-                  <Button variant="outline" size="icon" className="h-8 w-8" onClick={() => handlePan(0, 1)} disabled={zoomLevel <= 1}>
+                  <Button variant="outline" size="icon" className="h-8 w-8" onClick={() => handlePan(0, 1)}>
                     <ChevronDown className="w-4 h-4" />
                   </Button>
-                  <Button variant="outline" size="icon" className="h-8 w-8" onClick={() => handlePan(1, 0)} disabled={zoomLevel <= 1}>
+                  <Button variant="outline" size="icon" className="h-8 w-8" onClick={() => handlePan(1, 0)}>
                     <ChevronRight className="w-4 h-4" />
                   </Button>
                 </div>
-                <span className="text-[10px] text-muted-foreground/70">Mover camara (requiere zoom)</span>
+                <span className="text-[10px] text-muted-foreground/70">Mover camara</span>
               </div>
             </CardContent>
           </Card>
